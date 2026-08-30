@@ -6,9 +6,11 @@ for cards that want to drive the bar automatically instead.
 
 ## What it buys you
 
-Without `[PRESENT]`, presence is whatever you last tapped. With it, the card
-updates the roster itself as people enter and leave, and you only tap when it
-gets something wrong.
+Without `[PRESENT]`, presence comes from your taps plus whatever the optional
+prose and scene detection can read. Both of those are heuristics that abstain
+whenever they are unsure, so they will miss transitions your card knows about
+for certain. `[PRESENT]` removes the guesswork: the card states the roster and
+the bar follows it.
 
 A tap always beats a marker in the same message, and a marker in a *later*
 message takes over again. Whichever signal is most recent wins, so adding this

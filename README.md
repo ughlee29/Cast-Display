@@ -101,6 +101,65 @@ neither is `Alice looked left down the hall.`
 It never guesses from who spoke. Someone can sit silently in a room for twenty
 messages and stay present.
 
+### Scene changes
+
+A separate toggle, also off by default, for the case where the scene follows
+one character somewhere else and the rest of the cast stays behind.
+
+This is a bigger claim than enter/leave detection. Marking one character
+present implies marking everyone else absent — people the sentence never
+names. So it requires **two** independent things in the same message:
+
+1. A separation cue written from the movers' side — `out of the girls' line of
+   sight`, `away from the others`, `leaving the kids behind`, `just the two of
+   them`, `once they were alone`
+2. At least one cast member who is the subject of a movement verb, **within
+   three sentences of the cue**
+3. The cue must refer back to the movers — by name or by pronoun — and must not
+   name somebody else as the one being separated
+
+Point 3 is what stops two unrelated signals in one message from combining:
+`Nicole rose from the couch and crossed to the window. Across the hall, Loren
+and Sam were out of sight behind the door.` has a mover and a cue, but the cue
+names other people, so it abstains.
+
+A movement verb alone is not enough either, which is what keeps it from
+inverting:
+
+| Prose | Result |
+|---|---|
+| `Once they were out of the girls' sight, Nicole followed him into the kitchen.` | Ivy and Alice away |
+| `Nicole watched Alice storm out of the room.` | abstains — no separation cue |
+| `Nicole followed him into the kitchen.` | abstains — no separation cue |
+| `Nicole slipped away from the others.` + Ivy speaks | abstains — a stayer is present |
+| `Nicole laughed. "We should leave the kids and run away."` | abstains — dialogue, not narration |
+| `Nicole rose. Across the hall, Loren and Sam were out of sight.` | abstains — cue names other people |
+| `Nicole rose. A moment later, the kids were out of sight.` | abstains — cue does not refer to the mover |
+
+Quoted text is stripped before any of this runs, so a character *talking* about
+leaving never moves the scene.
+
+### Restore on speech
+
+Presence is never inferred from who spoke — but a character marked absent who
+is then given dialogue is usually present, so their absence is cleared. This
+runs in the safe direction only: it can un-fade someone, never fade them.
+
+Speech does not always mean presence, though. A character can shout from
+upstairs, call on the phone, or be heard through a door without entering the
+scene, so remote dialogue is vetoed and the roster is left unchanged:
+
+| Prose | Restores? |
+|---|---|
+| `Alice walked in. "Found you."` | yes |
+| `Alice called from upstairs. "Mom?"` | no |
+| `Alice: "Can you hear me?"` + `The phone crackled.` | no |
+| `Alice's voice drifted from the hallway.` | no |
+
+The veto is deliberately broad — `phone`, `intercom`, `muffled`, `in the
+distance`, `from the hallway` and similar all block a restore. A missed
+restore just means you tap the tile.
+
 ## The cast bar
 
 `[TRACK] Nicole:S6 | Ivy:S1` carries state values only. The S number is whatever
@@ -126,6 +185,7 @@ screens. Badges survive both.
 | Show state badge | The `S` value from `[TRACK]` |
 | Show cast bar on | Marker messages, latest message, or both |
 | Read enter / leave from prose | Optional third presence signal, off by default |
+| Also follow scene changes | Scene-transition detection, off by default, needs the above on |
 | Reset this card | Clears cast entries and presence for the current card and chat |
 
 ## Color ownership
