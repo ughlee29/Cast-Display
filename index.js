@@ -16,12 +16,15 @@ const defaults = {
     barSize: 'full',        // 'full' | 'compact'
     showStage: true,        // S-value badge from [TRACK]
     absentMode: 'fade',     // 'fade' | 'hide' | 'show'
+    barOn: 'both',          // 'markers' | 'last' | 'both'
+    autoPresence: false,    // read enter/leave from prose
     stateLine: 'dim',       // 'dim' | 'hide' | 'plain'
     attribute: true,        // color unmarked quotes
     promote: true,          // turn confidently-attributed prose into portrait blocks
     debug: false,           // show why each quote was attributed
     portraitPx: 256,
     cards: {},              // avatarKey -> { chars: { Name: { color, img } } }
+    presence: {},           // chatKey -> { away: [names], since: messageIndex }
 };
 
 const PALETTE = [
@@ -74,14 +77,40 @@ function colorOf(name) {
 // patterns
 // ---------------------------------------------------------------------------
 
-const NAME = "[A-Z][\\w'\u2019-]{1,19}";
-const RE_LABEL   = new RegExp(`^(${NAME}):[ \\t]*$`);
-const RE_INLINE  = new RegExp(`^(${NAME}):[ \\t]+(["\u201c\u201d].*)$`);
+// One capitalised word, or a caseless script (Han, Kana, Hangul, Arabic...),
+// optionally followed by up to two more such words. Covers Nicole, Mrs. Chen,
+// Kaito Ishida, Renee, Rio\u0301na and \u96ea alike.
+const NAME_PART = "(?:\\p{Lu}[\\p{L}\\p{M}'\u2019.-]{0,24}|[\\p{Lo}\\p{M}]{1,12})";
+const NAME = `${NAME_PART}(?:[ \\u00a0]${NAME_PART}){0,2}`;
 const RE_TRACK   = /^\[TRACK\][ \t]*(.*)$/;
 const RE_STATE   = /^\[STATE\][ \t]*(.*)$/;
 const RE_PRESENT = /^\[PRESENT\][ \t]*(.*)$/;
-const RE_TOKEN   = new RegExp(`(${NAME}):S(\\d+)`, 'g');
-const RE_ANY     = new RegExp(`^(${NAME}):`, 'gm');
+const RE_TOKEN   = new RegExp(`(?<![\\p{L}\\p{N}])(${NAME}):S(\\d+)`, 'gu');
+const RE_LABEL_LINE = new RegExp(`^\\s*(${NAME}):[ \\t]*(.*)$`, 'u');
+
+/**
+ * Rendering matches the literal names in the cast list, never the discovery
+ * regex. Whatever shape a name has - spaces, periods, any script - once it is
+ * in the cast it renders. Longest first so "Mrs. Chen" wins over "Chen".
+ */
+function castAlt() {
+    const names = Object.keys(cast());
+    if (!names.length) return null;
+    return names.slice().sort((a, b) => b.length - a.length).map(escRe).join('|');
+}
+
+function labelMatch(line) {
+    const alt = castAlt();
+    if (!alt) return null;
+    const m = line.match(new RegExp(`^(${alt}):[ \\t]*$`, 'u'));
+    return m ? m[1] : null;
+}
+
+function inlineMatch(line) {
+    const alt = castAlt();
+    if (!alt) return null;
+    return line.match(new RegExp(`^(${alt}):[ \\t]+(["\u201c\u201d].*)$`, 'u'));
+}
 
 const NOT_NAMES = new Set([
     'Note', 'Notes', 'Rule', 'Rules', 'Warning', 'Example', 'Examples',
@@ -89,41 +118,176 @@ const NOT_NAMES = new Set([
     'Personality', 'Description', 'Appearance', 'Background', 'Output',
     'Format', 'Instructions', 'You', 'Me', 'I', 'The', 'A', 'An', 'It',
     'Track', 'State', 'Status', 'Present', 'Objective', 'Goal', 'Tip',
+    'She', 'He', 'They', 'We', 'His', 'Her', 'Their', 'Its', 'Our', 'My', 'Your',
+    'Then', 'But', 'And', 'When', 'While', 'After', 'Before', 'If', 'This',
+    'That', 'There', 'Here', 'What', 'Why', 'How', 'Who', 'One', 'Two', 'Both',
+    'Also', 'So', 'Now', 'Later', 'Meanwhile', 'Suddenly', 'Finally', 'Instead',
+    'Everyone', 'Someone', 'Nobody', 'Something', 'Nothing', 'Dialogue',
+    'Character', 'Traits', 'Likes', 'Dislikes', 'Quirks', 'Speech', 'Voice',
+    'Relationships', 'Abilities', 'Inventory', 'Lore', 'Backstory', 'Overview',
+    'Motivation', 'Secrets', 'Details', 'Info', 'Information', 'Appearance',
 ]);
 
-function harvest(text, into) {
+/**
+ * Section headings that introduce a cast list. Matched whole, so
+ * "Family Dynamics" is not a cast section even though "Family" is.
+ */
+const CAST_SECTION = /^(?:the\s+)?(?:main\s+|supporting\s+|other\s+)?(?:characters?|cast|npcs?|family|household|residents|people|party|members|roster|companions|dramatis\s+personae)(?:\s+list)?$/i;
+
+/**
+ * Strong signals: shapes that only appear when something really is a speaker.
+ * These are trusted on their own.
+ */
+function strongPatterns() {
+    const say = SAY_VERBS.join('|');
+    return [
+        RE_TOKEN,                                                      // Name:S6
+        // [ \t] not \s throughout: \s crosses newlines, which lets a match start
+        // on one line and capture the name from the next one
+        new RegExp(`${EDGE_L}(${NAME})[ \\t]+(?:\\w+[ \\t]+){0,2}?(?:${say})${EDGE_R}`, 'gu'),
+        new RegExp(`${EDGE_L}(?:${say})[ \\t]+(${NAME})${EDGE_R}`, 'gu'),
+        // action beat followed by a quote on the same line: Piet grinned. "..."
+        // The quote is what makes this reliable - "The Chevy turned over." has none.
+        new RegExp(
+            `${EDGE_L}(${NAME})[ \\t]+(?:\\w+[ \\t]+){0,3}?(?:${ALL_VERBS.join('|')})`
+            + `${EDGE_R}[^"\u201c\u201d\\n]{0,80}["\u201c]`, 'gu'),
+    ];
+}
+
+function acceptable(name) {
+    // NAME_PART allows an internal period for "Mrs. Chen", which also swallows
+    // the full stop in "muttered Grix." - strip trailing punctuation back off
+    const clean = name?.trim().replace(/[.\-'’]+$/u, '').trim();
+    if (!clean || NOT_NAMES.has(clean)) return null;
+    if (clean.split(/\s+/).every(w => NOT_NAMES.has(w))) return null;
+    return clean;
+}
+
+/**
+ * `Name:` is only a speaker label when dialogue follows it. Cards are full of
+ * field labels in the same shape - "Family Dynamics:", "Character Goals:",
+ * "Speech Patterns:" - so a colon label with prose or another label after it
+ * is demoted to a weak signal needing corroboration.
+ *
+ * This is discovery only. Chat-side rendering matches the literal cast list,
+ * so speaker blocks are unaffected.
+ */
+function harvestColonLabels(text, strong, loose) {
+    const lines = String(text).split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(RE_LABEL_LINE);
+        if (!m) continue;
+        const name = acceptable(m[1]);
+        if (!name) continue;
+
+        let rest = m[2].trim();
+        if (!rest) {
+            let j = i + 1;
+            while (j < lines.length && !lines[j].trim()) j++;
+            rest = j < lines.length ? lines[j].trim() : '';
+        }
+        if (/^["\u201c\u201d]/.test(rest)) strong.add(name);
+        else loose.add(name);
+    }
+}
+
+function harvestStrong(text, into) {
+    for (const re of strongPatterns()) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const n = acceptable(m[1]);
+            if (n) into.add(n);
+        }
+    }
+}
+
+/**
+ * Weak signals: headings and list items. Ordinary cards are full of these
+ * ("## Personality", "- Sarcastic"), so they are only trusted when they sit
+ * inside a cast-like section. Otherwise they are held aside and admitted only
+ * if some strong signal names the same character elsewhere.
+ */
+function harvestWeak(text, section, loose) {
+    const head    = new RegExp(`^\\s*(#{1,6})\\s*(${NAME})\\s*:?\\s*$`, 'u');
+    const bold    = new RegExp(`^\\s*\\*\\*\\s*(${NAME})\\s*\\*\\*\\s*:?\\s*$`, 'u');
+    const bullet  = new RegExp(`^\\s*[-*\u2022]\\s+(${NAME})\\s*:?\\s*$`, 'u');
+    const bracket = new RegExp(`^\\s*\\[\\s*(${NAME})\\s*\\]\\s*$`, 'u');
+
+    let depth = 0;  // 0 = not inside a cast section
+    for (const raw of String(text).split(/\r?\n/)) {
+        const line = raw.trimEnd();
+
+        let m = line.match(head);
+        if (m) {
+            const d = m[1].length;
+            const label = m[2].trim();
+            if (CAST_SECTION.test(label)) { depth = d; continue; }
+            if (depth && d > depth) { const n = acceptable(label); if (n) section.add(n); continue; }
+            depth = 0;
+            const n = acceptable(label);
+            if (n) loose.add(n);
+            continue;
+        }
+
+        m = line.match(bold) || line.match(bracket);
+        if (m) {
+            const label = m[1].trim();
+            if (CAST_SECTION.test(label)) { depth = depth || 1; continue; }
+            depth = 0;                       // a different header ends the section
+            const n = acceptable(label);
+            if (n) loose.add(n);
+            continue;
+        }
+
+        m = line.match(bullet);
+        if (m) {
+            const label = m[1].trim();
+            if (CAST_SECTION.test(label)) { depth = depth || 1; continue; }
+            const n = acceptable(label);
+            if (n) (depth ? section : loose).add(n);
+        }
+    }
+}
+
+function newHarvest() {
+    return { strong: new Set(), section: new Set(), loose: new Set() };
+}
+
+function harvest(text, acc) {
     if (!text) return;
-    let m;
-    RE_ANY.lastIndex = 0;
-    while ((m = RE_ANY.exec(text)) !== null) {
-        if (!NOT_NAMES.has(m[1])) into.add(m[1]);
-    }
-    RE_TOKEN.lastIndex = 0;
-    while ((m = RE_TOKEN.exec(text)) !== null) {
-        if (!NOT_NAMES.has(m[1])) into.add(m[1]);
-    }
+    harvestStrong(text, acc.strong);
+    harvestColonLabels(text, acc.strong, acc.loose);
+    harvestWeak(text, acc.section, acc.loose);
+}
+
+/** Strong always; in-section always; loose only when a strong signal agrees. */
+function resolveHarvest(acc) {
+    const out = new Set([...acc.strong, ...acc.section]);
+    for (const n of acc.loose) if (acc.strong.has(n)) out.add(n);
+    return out;
 }
 
 /** Names found in the character card itself, before anyone has spoken. */
 function scanCard() {
     const ctx = getContext();
-    const found = new Set();
+    const acc = newHarvest();
     const ch = ctx.characters?.[ctx.characterId];
     if (ch) {
         for (const f of [ch.description, ch.personality, ch.scenario, ch.first_mes, ch.mes_example]) {
-            harvest(f, found);
+            harvest(f, acc);
         }
-        for (const g of (ch.data?.alternate_greetings ?? [])) harvest(g, found);
+        for (const g of (ch.data?.alternate_greetings ?? [])) harvest(g, acc);
     }
-    return found;
+    return resolveHarvest(acc);
 }
 
 function scanChat() {
-    const found = new Set();
+    const acc = newHarvest();
     for (const msg of (getContext().chat ?? [])) {
-        if (!msg.is_user) harvest(msg.mes, found);
+        if (!msg.is_user) harvest(msg.mes, acc);
     }
-    return found;
+    return resolveHarvest(acc);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +310,11 @@ const SOFT_VERBS = ['smiled', 'grinned', 'laughed', 'chuckled', 'shrugged', 'nod
     'set', 'put', 'placed', 'reached', 'stood', 'sat', 'rose', 'stepped', 'moved',
     'pulled', 'pushed', 'opened', 'closed', 'wiped', 'folded', 'tucked', 'brushed',
     'tapped', 'waved', 'pointed', 'gestured', 'hesitated', 'exhaled', 'swallowed',
-    'straightened', 'settled', 'dropped', 'lifted', 'took', 'walked', 'turned'];
+    'straightened', 'settled', 'dropped', 'lifted', 'took', 'walked', 'turned',
+    'rolled', 'tossed', 'huffed', 'scoffed', 'smirked', 'sniffed', 'grimaced',
+    'flashed', 'shot', 'arched', 'quirked',
+    // light-verb action beats: "Alice let out a snort", "Nicole gave a laugh"
+    'let out', 'let slip', 'gave', 'heaved', 'released', 'made'];
 
 const ALL_VERBS = SAY_VERBS.concat(SOFT_VERBS);
 const RE_QUOTE = /["\u201c]([^"\u201c\u201d]{1,800}?)["\u201d]/g;
@@ -161,13 +329,46 @@ function escRe(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Distinct cast names appearing as whole words in a fragment. */
-function namesIn(text, names) {
-    const hits = new Set();
-    for (const n of names) {
-        if (new RegExp(`\\b${escRe(n)}\\b`).test(text)) hits.add(n);
+/**
+ * \b is defined against ASCII \w, so it forms no boundary beside "e\u0301" or
+ * "\u96ea" and names in those scripts silently never match. Letter/number
+ * lookarounds work in every script and handle multi-word names too.
+ */
+const EDGE_L = '(?<![\\p{L}\\p{N}])';
+const EDGE_R = '(?![\\p{L}\\p{N}])';
+
+function nameRe(name, flags = '') {
+    return new RegExp(`${EDGE_L}${escRe(name)}${EDGE_R}`, `${flags}u`);
+}
+
+/**
+ * Occurrences of `name` in `text`, skipping any that sit inside a longer cast
+ * name. Without this, a cast holding both "Chen" and "Mrs. Chen" sees two
+ * candidates for one clause and abstains on every line either of them speaks.
+ */
+function occurrences(text, name, names) {
+    const longer = names.filter(o => o !== name && o.length > name.length && o.includes(name));
+    const blocked = [];
+    for (const o of longer) {
+        const re = nameRe(o, 'g');
+        let m;
+        while ((m = re.exec(text)) !== null) blocked.push([m.index, m.index + o.length]);
     }
-    return [...hits];
+    const out = [];
+    const re = nameRe(name, 'g');
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const a = m.index;
+        const b = a + name.length;
+        if (blocked.some(([x, y]) => a >= x && b <= y)) continue;
+        out.push(a);
+    }
+    return out;
+}
+
+/** Distinct cast names genuinely present in a fragment. */
+function namesIn(text, names) {
+    return names.filter(n => occurrences(text, n, names).length > 0);
 }
 
 /**
@@ -177,18 +378,16 @@ function namesIn(text, names) {
  * `mustLead` also requires the name to open the fragment, used for the
  * trailing-tag form where a soft verb is only trustworthy right after a quote.
  */
-function subjectOf(frag, name, verbs, mustLead) {
+function subjectOf(frag, name, verbs, mustLead, names) {
     const vs = verbs.join('|');
-    const forward = new RegExp(`^[\\s,]*(?:\\w+\\s+){0,3}?(?:${vs})\\b`, 'i');
-    const inverted = new RegExp(`\\b(?:${vs})\\s+$`, 'i');
-    const finder = new RegExp(`\\b${escRe(name)}\\b`, 'g');
-    let m;
-    while ((m = finder.exec(frag)) !== null) {
-        const pre = frag.slice(0, m.index);
-        if (mustLead && /[A-Za-z]/.test(pre)) continue;
-        const prev = (pre.match(/([A-Za-z']+)[^A-Za-z']*$/) || [])[1];
+    const forward = new RegExp(`^[\\s,]*(?:\\w+\\s+){0,3}?(?:${vs})${EDGE_R}`, 'iu');
+    const inverted = new RegExp(`${EDGE_L}(?:${vs})\\s+$`, 'iu');
+    for (const idx of occurrences(frag, name, names)) {
+        const pre = frag.slice(0, idx);
+        if (mustLead && /[\p{L}]/u.test(pre)) continue;
+        const prev = (pre.match(/([\p{L}']+)[^\p{L}']*$/u) || [])[1];
         if (prev && OBJECT_PREPS.has(prev.toLowerCase())) continue;
-        const post = frag.slice(m.index + name.length, m.index + name.length + 48);
+        const post = frag.slice(idx + name.length, idx + name.length + 48);
         if (forward.test(post) || inverted.test(pre)) return true;
     }
     return false;
@@ -196,7 +395,7 @@ function subjectOf(frag, name, verbs, mustLead) {
 
 /** Names in `frag` that pass the subject test. Exactly one, or nobody. */
 function pick(frag, names, verbs, mustLead) {
-    const found = namesIn(frag, names).filter(n => subjectOf(frag, n, verbs, mustLead));
+    const found = namesIn(frag, names).filter(n => subjectOf(frag, n, verbs, mustLead, names));
     return found.length === 1 ? found[0] : null;
 }
 
@@ -208,8 +407,9 @@ function pick(frag, names, verbs, mustLead) {
  */
 function pickTight(frag, names) {
     const vs = SAY_VERBS.join('|');
-    const found = names.filter(n => new RegExp(
-        `\\b${escRe(n)}\\b(?:\\s+\\w+){0,2}\\s+(?:${vs})\\s*[,:\u2014-]?\\s*$`, 'i').test(frag));
+    const tail = new RegExp(`^(?:\\s+\\w+){0,2}\\s+(?:${vs})\\s*[,:\u2014-]?\\s*$`, 'iu');
+    const found = names.filter(n =>
+        occurrences(frag, n, names).some(i => tail.test(frag.slice(i + n.length))));
     return found.length === 1 ? found[0] : null;
 }
 
@@ -300,6 +500,146 @@ function colorAllQuotes(root, color) {
 }
 
 // ---------------------------------------------------------------------------
+// presence - chat-keyed, deterministic, model never consulted
+//
+// Resolution is a fold over the chat, oldest to newest. Each signal replaces
+// the roster, so the most recent one wins whoever produced it:
+//   [PRESENT] line   sets the roster absolutely for that message onward
+//   manual tap       set at the message you tapped, beats a marker there
+//   prose detection  optional, off by default, abstains unless explicit
+// With no signal at all, everybody discovered is present.
+// ---------------------------------------------------------------------------
+
+/** Presence belongs to the chat: same card, two chats, different rooms. */
+function chatKey() {
+    const ctx = getContext();
+    const id = ctx.chatId ?? ctx.getCurrentChatId?.();
+    return id ? `chat:${id}` : cardKey();
+}
+
+function presenceStore() {
+    const s = settings();
+    const key = chatKey();
+    if (!key) return null;
+    return s.presence[key] ?? null;
+}
+
+function setPresence(away, since) {
+    const s = settings();
+    const key = chatKey();
+    if (!key) return;
+    s.presence[key] = { away: [...away], since };
+    invalidateTimeline();
+    saveSettingsDebounced();
+}
+
+/** Names listed on a [PRESENT] line, or null when the message has none. */
+function markerRoster(text) {
+    const valid = new RegExp(`^${NAME}$`, 'u');
+    for (const raw of String(text).split(/\r?\n/)) {
+        const m = raw.trim().match(RE_PRESENT);
+        if (m) return m[1].split(/[|,]/).map(x => x.trim()).filter(x => valid.test(x));
+    }
+    return null;
+}
+
+const LEAVE_PHRASES = [
+    'left the (?:room|kitchen|house|table|building)',
+    // bare "left" only as a complete clause: "Alice left." not "Alice left her phone"
+    'left(?=\\s*[.,;!?]|$)', 'left for \\w+',
+    '(?:walked|stepped|slipped|headed|ducked) out(?: of the \\w+)?',
+    '(?:went|headed|disappeared|retreated|vanished) (?:upstairs|downstairs|inside|outside|home|off|to bed|to her room|to his room)',
+    'excused (?:herself|himself|themselves)',
+    '(?:exited|departed)',
+];
+
+const ARRIVE_PHRASES = [
+    'came (?:back|in|downstairs|upstairs|inside)',
+    '(?:walked|stepped) in(?:to the \\w+)?',
+    'entered the (?:room|kitchen|house)',
+    '(?:returned|reappeared|rejoined|arrived)',
+    'joined (?:them|us|the \\w+)',
+];
+
+function phraseHit(text, name, phrases, names) {
+    const idxs = occurrences(text, name, names);
+    if (!idxs.length) return false;
+    return phrases.some(p => {
+        const re = new RegExp(`^(?:\\s+\\w+){0,2}\\s+(?:${p})${EDGE_R}`, 'iu');
+        return idxs.some(i => re.test(text.slice(i + name.length)));
+    });
+}
+
+/** Conservative enter/leave reading. Only fires on explicit phrasing. */
+function applyProse(text, away, names) {
+    let next = away;
+    for (const n of names) {
+        if (phraseHit(text, n, ARRIVE_PHRASES, names)) {
+            next = next ?? new Set();
+            next.delete(n);
+        } else if (phraseHit(text, n, LEAVE_PHRASES, names)) {
+            next = next ?? new Set();
+            next.add(n);
+        }
+    }
+    return next;
+}
+
+let timelineCache = { key: null, data: [] };
+
+function invalidateTimeline() {
+    timelineCache = { key: null, data: [] };
+}
+
+/**
+ * away-set per message index, or null where nothing is known yet.
+ * Cached: recomputing per message would be quadratic on long chats.
+ */
+function timeline() {
+    const s = settings();
+    const chat = getContext().chat ?? [];
+    const ov = presenceStore();
+    const names = Object.keys(cast());
+    const key = [chatKey(), chat.length, s.autoPresence, names.join(','), JSON.stringify(ov)].join('|');
+    if (timelineCache.key === key) return timelineCache.data;
+
+    const data = [];
+    let away = null;
+    for (let i = 0; i < chat.length; i++) {
+        const msg = chat[i];
+        if (msg && !msg.is_user && !msg.is_system) {
+            const listed = markerRoster(msg.mes);
+            if (listed) {
+                away = new Set(names.filter(n => !listed.includes(n)));
+            } else if (s.autoPresence) {
+                const next = applyProse(msg.mes, away ? new Set(away) : null, names);
+                if (next) away = next;
+            }
+        }
+        // a tap at this message outranks whatever the message itself claimed
+        if (ov && ov.since === i) away = new Set(ov.away);
+        data.push(away ? new Set(away) : null);
+    }
+    timelineCache = { key, data };
+    return data;
+}
+
+function awayAt(idx) {
+    const t = timeline();
+    return t[idx] ?? null;
+}
+
+function toggleAway(name) {
+    const chat = getContext().chat ?? [];
+    const idx = Math.max(0, chat.length - 1);
+    const current = awayAt(idx) ?? new Set();
+    const next = new Set(current);
+    if (next.has(name)) next.delete(name); else next.add(name);
+    setPresence(next, idx);
+    redrawAll();
+}
+
+// ---------------------------------------------------------------------------
 // rendering
 // ---------------------------------------------------------------------------
 
@@ -336,7 +676,9 @@ function speakerBlock(name, line, mesId) {
 }
 
 function castCard(name, badge, faded) {
-    return `<div class="cd-card${faded ? ' cd-absent' : ''}" style="--cd-color:${esc(colorOf(name))}">`
+    return `<div class="cd-card${faded ? ' cd-absent' : ''}" data-name="${esc(name)}"`
+        + ` title="Tap to mark ${esc(name)} ${faded ? 'present' : 'away'}"`
+        + ` style="--cd-color:${esc(colorOf(name))}">`
         + portrait(name, 'cd-card-img')
         + (badge ? `<span class="cd-card-badge">${esc(badge)}</span>` : '')
         + `<span class="cd-card-name">${esc(name)}</span></div>`;
@@ -346,7 +688,7 @@ function castCard(name, badge, faded) {
 function scanMarkers(lines) {
     const track = [];
     let present = null;
-    const valid = new RegExp(`^${NAME}$`);
+    const valid = new RegExp(`^${NAME}$`, 'u');
     for (const raw of lines) {
         const t = raw.trim();
         let m = t.match(RE_TRACK);
@@ -357,9 +699,7 @@ function scanMarkers(lines) {
             continue;
         }
         m = t.match(RE_PRESENT);
-        if (m) {
-            present = m[1].split(/[|,]/).map(x => x.trim()).filter(x => valid.test(x));
-        }
+        if (m) present = m[1].split(/[|,]/).map(x => x.trim()).filter(x => valid.test(x));
     }
     return { track, present };
 }
@@ -369,39 +709,37 @@ function scanMarkers(lines) {
  * nothing about who is in the room. Presence comes solely from [PRESENT]; with
  * no such line, nobody is marked absent rather than presence being guessed.
  */
-function buildBar(track, present) {
+function buildBar(track, away) {
     const s = settings();
     if (!s.showBar) return '';
 
     const stage = new Map(track.map(t => [t.name, t.s]));
-    const here = present ? new Set(present) : null;
-
     const order = [];
     const push = n => { if (!order.includes(n)) order.push(n); };
     track.forEach(t => push(t.name));
-    (present ?? []).forEach(push);
-    if (here) Object.keys(cast()).forEach(push);
+    Object.keys(cast()).forEach(push);
     if (!order.length) return '';
 
     const cards = [];
     for (const n of order) {
-        const absent = here ? !here.has(n) : false;
+        const absent = away ? away.has(n) : false;
         if (absent && s.absentMode === 'hide') continue;
         const badge = (s.showStage && stage.has(n)) ? `S${stage.get(n)}` : '';
         cards.push(castCard(n, badge, absent && s.absentMode === 'fade'));
     }
     if (!cards.length) return '';
 
-    const label = here ? 'Present Characters' : s.barLabel;
+    const label = away ? 'Present Characters' : s.barLabel;
     const cls = s.barSize === 'compact' ? ' cd-compact' : '';
     return `<div class="cd-bar${cls}"><div class="cd-bar-head">${esc(label)}</div>`
         + `<div class="cd-bar-row">${cards.join('')}</div></div>`;
 }
 
-function build(raw, mesId) {
+function build(raw, mesId, isLast) {
     const s = settings();
     const lines = String(raw).split(/\r?\n/);
     const markers = scanMarkers(lines);
+    const away = awayAt(mesId);
     const out = [];
     let buf = [];
     let barDone = false;
@@ -423,8 +761,8 @@ function build(raw, mesId) {
 
         if (RE_TRACK.test(trimmed) || RE_PRESENT.test(trimmed)) {
             flush();
-            if (!barDone) {
-                const bar = buildBar(markers.track, markers.present);
+            if (!barDone && s.barOn !== 'last') {
+                const bar = buildBar(markers.track, away);
                 if (bar) out.push(bar);
                 barDone = true;
             }
@@ -440,16 +778,17 @@ function build(raw, mesId) {
             continue;
         }
 
-        m = trimmed.match(RE_INLINE);
-        if (m && cast()[m[1]]) { flush(); out.push(speakerBlock(m[1], m[2], mesId)); continue; }
+        m = inlineMatch(trimmed);
+        if (m) { flush(); out.push(speakerBlock(m[1], m[2], mesId)); continue; }
 
-        m = trimmed.match(RE_LABEL);
-        if (m && cast()[m[1]]) {
+        const label = labelMatch(trimmed);
+        if (label) {
+            m = [null, label];
             let j = i + 1;
             while (j < lines.length && !lines[j].trim()) j++;
             if (j < lines.length) {
                 flush();
-                out.push(speakerBlock(m[1], lines[j].trim(), mesId));
+                out.push(speakerBlock(label, lines[j].trim(), mesId));
                 i = j;
                 continue;
             }
@@ -458,6 +797,12 @@ function build(raw, mesId) {
         buf.push(line);
     }
     flush();
+
+    // markerless cards still get a bar: pin one to the newest message
+    if (!barDone && isLast && s.barOn !== 'markers') {
+        const bar = buildBar(markers.track, away);
+        if (bar) out.push(bar);
+    }
     return out.join('');
 }
 
@@ -545,7 +890,8 @@ function decorate(mesId) {
     const el = document.querySelector(`.mes[mesid="${mesId}"] .mes_text`);
     if (!el || el.closest('.mes')?.querySelector('.edit_textarea')) return;
 
-    const html = build(msg.mes, mesId);
+    const isLast = mesId === (ctx.chat.length - 1);
+    const html = build(msg.mes, mesId, isLast);
     if (!html) return;
     el.innerHTML = html;
     attributeQuotes(el);
@@ -694,7 +1040,16 @@ const PANEL = `
         <option value="hide">Hide</option>
         <option value="show">Show</option>
       </select>
-      <small class="cd-hint">Absence comes only from a [PRESENT] line. Without one, nobody is marked absent.</small>
+      <small class="cd-hint">Tap any tile in the cast bar to toggle present / away. A [PRESENT] line in a later message overrides your tap.</small>
+
+      <label class="checkbox_label"><input type="checkbox" id="cd-autopresence"> Read enter / leave from prose</label>
+
+      <label for="cd-baron">Show cast bar on</label>
+      <select id="cd-baron" class="text_pole">
+        <option value="both">Marker messages and the latest</option>
+        <option value="markers">Marker messages only</option>
+        <option value="last">Latest message only</option>
+      </select>
 
       <label for="cd-barlabel">Cast bar label</label>
       <input type="text" id="cd-barlabel" class="text_pole" placeholder="Cast">
@@ -750,7 +1105,9 @@ function bindPanel() {
     bindCheck('cd-debug', 'debug');
     bindCheck('cd-showbar', 'showBar');
     bindCheck('cd-showstage', 'showStage');
+    bindCheck('cd-autopresence', 'autoPresence', () => { invalidateTimeline(); redrawAll(); });
 
+    bindSelect('cd-baron', 'barOn');
     bindSelect('cd-barsize', 'barSize');
     bindSelect('cd-absent', 'absentMode');
     bindSelect('cd-state', 'stateLine');
@@ -789,6 +1146,9 @@ function bindPanel() {
             ctx.POPUP_TYPE.CONFIRM);
         if (!ok) return;
         settings().cards[key] = { chars: {} };
+        const ck = chatKey();
+        if (ck) delete settings().presence[ck];
+        invalidateTimeline();
         saveSettingsDebounced();
         drawPanel();
         redrawAll();
@@ -806,13 +1166,23 @@ jQuery(async () => {
     bindPanel();
     drawPanel();
 
-    const onRendered = id => decorate(Number(id));
+    // one delegated listener: bars are rebuilt on every render
+    document.addEventListener('click', e => {
+        const card = e.target.closest?.('#chat .cd-card');
+        if (!card?.dataset.name) return;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleAway(card.dataset.name);
+    });
+
+    const onRendered = id => { invalidateTimeline(); decorate(Number(id)); };
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onRendered);
     eventSource.on(event_types.MESSAGE_SWIPED, onRendered);
     eventSource.on(event_types.MESSAGE_EDITED, onRendered);
     eventSource.on(event_types.MESSAGE_UPDATED, onRendered);
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        invalidateTimeline();
         drawPanel();
         setTimeout(redrawAll, 60);
     });
