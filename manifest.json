@@ -1,0 +1,12 @@
+{
+  "display_name": "Cast Display",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "",
+  "version": "1.1.0",
+  "homePage": "",
+  "auto_update": false
+}
