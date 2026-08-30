@@ -18,6 +18,7 @@ const defaults = {
     absentMode: 'fade',     // 'fade' | 'hide' | 'show'
     barOn: 'both',          // 'markers' | 'last' | 'both'
     autoPresence: false,    // read enter/leave from prose
+    sceneMoves: false,      // read scene transitions from prose
     stateLine: 'dim',       // 'dim' | 'hide' | 'plain'
     attribute: true,        // color unmarked quotes
     promote: true,          // turn confidently-attributed prose into portrait blocks
@@ -585,6 +586,178 @@ function applyProse(text, away, names) {
     return next;
 }
 
+// --- scene transitions ------------------------------------------------------
+//
+// Marking one character present implies marking everyone else absent, which is
+// a claim about people the sentence never names. So this needs two independent
+// things in the same message before it fires:
+//
+//   1. a separation cue written from the movers' side - "out of the girls'
+//      line of sight", "away from the others", "just the two of them"
+//   2. at least one cast member who is the subject of a movement verb
+//
+// A movement verb alone is not enough. "Nicole watched Alice storm out of the
+// room" has a mover and a destination, but no separation cue, so it abstains
+// rather than fading the two people who stayed put.
+
+const MOVE_VERBS = ['followed', 'follows', 'following', 'headed', 'heads', 'walked',
+    'walks', 'stepped', 'steps', 'moved', 'moves', 'went', 'goes', 'slipped', 'slips',
+    'wandered', 'led', 'leads', 'trailed', 'trails', 'rounded', 'rounds', 'rose',
+    'rises', 'stood', 'stands', 'slid', 'slides', 'drifted', 'ducked', 'retreated',
+    'withdrew', 'disappeared', 'vanished', 'crossed', 'entered', 'exited', 'left'];
+
+const SEPARATION_CUES = [
+    "out of (?:[\\w'\u2019]+ ){0,6}?(?:sight|earshot|view|hearing)",
+    'away from (?:the |them|everyone|everybody)',
+    'leaving (?:the )?(?:girls|kids|children|others|rest|them|everyone)',
+    'once they were (?:alone|out|away|clear)',
+    'just the two of (?:them|us)',
+    'alone together',
+    'no longer (?:in|within) (?:sight|earshot|view)',
+    'on their own',
+    'by themselves',
+];
+
+const SEPARATION_RE = new RegExp(`(?:${SEPARATION_CUES.join('|')})`, 'iu');
+
+/** Dialogue is not narration: "I'm leaving the kids" must not move the scene. */
+function stripQuotes(text) {
+    return String(text).replace(RE_QUOTE, ' ');
+}
+
+/** Cast members explicitly given dialogue in this message. */
+function speakersIn(text, names) {
+    const out = new Set();
+    for (const raw of String(text).split(/\r?\n/)) {
+        const m = raw.match(RE_LABEL_LINE);
+        if (m && names.includes(m[1].trim())) out.add(m[1].trim());
+    }
+    const narration = stripQuotes(text);
+    for (const n of names) {
+        if (subjectOf(narration, n, SAY_VERBS, false, names)) out.add(n);
+    }
+    return [...out];
+}
+
+/** Rough sentence split. Good enough to bound a narrative window. */
+function sentences(text) {
+    return String(text).split(/(?<=[.!?\u2026])\s+|\n+/).filter(s => s.trim());
+}
+
+/**
+ * Pronouns that can stand in for the movers in a cue clause. "Once they were
+ * out of sight" refers back to whoever just moved; "the kids were out of
+ * sight" does not.
+ */
+const MOVER_PRONOUN = /(?<![\p{L}\p{N}])(?:they|them|she|he|both|the two of them|the pair|we|us)(?![\p{L}\p{N}])/iu;
+
+/**
+ * A separation cue only counts when it is about the movers. The clause leading
+ * into the cue must refer back to them - by name or by pronoun - and must not
+ * name somebody else as the one being separated.
+ */
+function cueBelongsToMovers(sentence, cueIndex, cueLength, movers, names) {
+    // Everything before the cue decides whether somebody ELSE is the one being
+    // separated. The referent can also sit inside the cue itself - "once they
+    // were alone" carries its own pronoun - so that scope includes the match.
+    const lead = sentence.slice(0, cueIndex);
+    const scope = sentence.slice(0, cueIndex + cueLength);
+
+    // somebody else is the one out of sight: "Loren and Sam were out of sight".
+    // The first token is skipped - every sentence starts capitalised, so "Once"
+    // and "Across" are not people.
+    const others = new RegExp(`(?<![\\p{L}\\p{N}])(${NAME})(?![\\p{L}\\p{N}])`, 'gu');
+    let m;
+    while ((m = others.exec(lead)) !== null) {
+        if (m.index === 0) continue;
+        const who = acceptable(m[1]);
+        if (who && !movers.includes(who)) return false;
+    }
+
+    if (movers.some(n => occurrences(scope, n, names).length > 0)) return true;
+    return MOVER_PRONOUN.test(scope);
+}
+
+function applyScene(text, away, names) {
+    const narration = stripQuotes(text);
+    const sents = sentences(narration);
+
+    // movers must appear in the cue sentence or shortly before it, not merely
+    // somewhere in the same message
+    const WINDOW = 3;
+    let movers = null;
+
+    for (let i = 0; i < sents.length; i++) {
+        const hit = SEPARATION_RE.exec(sents[i]);
+        SEPARATION_RE.lastIndex = 0;
+        if (!hit) continue;
+
+        const local = sents.slice(Math.max(0, i - WINDOW), i + 1).join(' ');
+        const found = names.filter(n => subjectOf(local, n, MOVE_VERBS, false, names));
+        if (!found.length) continue;
+        if (!cueBelongsToMovers(sents[i], hit.index, hit[0].length, found, names)) continue;
+
+        movers = found;
+        break;
+    }
+    if (!movers) return away;
+
+    const staying = names.filter(n => !movers.includes(n));
+    if (!staying.length) return away;
+
+    // someone who stayed behind is speaking here, so the scene did not separate
+    const speaking = speakersIn(text, names);
+    if (staying.some(n => speaking.includes(n))) return away;
+
+    const next = new Set(away ?? []);
+    for (const n of staying) next.add(n);
+    for (const n of movers) next.delete(n);
+    return next;
+}
+
+/**
+ * Speech does not prove physical presence. A character can shout from upstairs,
+ * call on the phone, or be heard through a door without entering the scene.
+ */
+const REMOTE_CUES = [
+    'from (?:the )?(?:upstairs|downstairs|hall|hallway|kitchen|doorway|outside|porch|yard|garage|other room|another room|next room|below|above|street|car)',
+    'down the hall', 'across the house', 'from the top of the stairs',
+    '(?:called|shouted|yelled|hollered|shouting|calling) (?:out )?from',
+    'voice (?:came|drifted|floated|carried|echoed)',
+    '(?:over|on|through) the (?:phone|line|radio|intercom|speaker|comm|door|wall)',
+    '(?<![\\p{L}\\p{N}])(?:phone|intercom|walkie|receiver|speakerphone|earpiece|headset|voicemail)(?![\\p{L}\\p{N}])',
+    'through the (?:door|wall|window)',
+    'in the distance', 'muffled', 'disembodied',
+];
+
+const REMOTE_RE = new RegExp(`(?:${REMOTE_CUES.join('|')})`, 'iu');
+
+/** Cast names sharing a paragraph with a remote-speech cue. */
+function remoteSpeakers(text, names) {
+    const out = new Set();
+    for (const block of String(text).split(/\n\s*\n/)) {
+        if (!REMOTE_RE.test(block)) continue;
+        for (const n of namesIn(block, names)) out.add(n);
+    }
+    return out;
+}
+
+/**
+ * Restore-only guard. Presence is never inferred from who spoke - but someone
+ * marked absent who is then given dialogue is usually present, and un-fading
+ * can only ever correct an error. Remote speech is vetoed: if the dialogue
+ * could be coming from elsewhere, leave the roster unchanged.
+ */
+function restoreSpeakers(text, away, names) {
+    if (!away || !away.size) return away;
+    const remote = remoteSpeakers(text, names);
+    const speaking = speakersIn(text, names).filter(n => !remote.has(n));
+    if (!speaking.length) return away;
+    const next = new Set(away);
+    for (const n of speaking) next.delete(n);
+    return next;
+}
+
 let timelineCache = { key: null, data: [] };
 
 function invalidateTimeline() {
@@ -600,7 +773,7 @@ function timeline() {
     const chat = getContext().chat ?? [];
     const ov = presenceStore();
     const names = Object.keys(cast());
-    const key = [chatKey(), chat.length, s.autoPresence, names.join(','), JSON.stringify(ov)].join('|');
+    const key = [chatKey(), chat.length, s.autoPresence, s.sceneMoves, names.join(','), JSON.stringify(ov)].join('|');
     if (timelineCache.key === key) return timelineCache.data;
 
     const data = [];
@@ -612,7 +785,9 @@ function timeline() {
             if (listed) {
                 away = new Set(names.filter(n => !listed.includes(n)));
             } else if (s.autoPresence) {
-                const next = applyProse(msg.mes, away ? new Set(away) : null, names);
+                let next = applyProse(msg.mes, away ? new Set(away) : null, names);
+                if (s.sceneMoves) next = applyScene(msg.mes, next ?? (away ? new Set(away) : null), names);
+                next = restoreSpeakers(msg.mes, next ?? away, names);
                 if (next) away = next;
             }
         }
@@ -644,7 +819,7 @@ function toggleAway(name) {
 // ---------------------------------------------------------------------------
 
 function esc(s) {
-    return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    return String(s).replace(/[&<>\"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));
 }
 
 function fmt(text, mesId) {
@@ -1043,6 +1218,7 @@ const PANEL = `
       <small class="cd-hint">Tap any tile in the cast bar to toggle present / away. A [PRESENT] line in a later message overrides your tap.</small>
 
       <label class="checkbox_label"><input type="checkbox" id="cd-autopresence"> Read enter / leave from prose</label>
+      <label class="checkbox_label"><input type="checkbox" id="cd-scenemoves"> Also follow scene changes</label>
 
       <label for="cd-baron">Show cast bar on</label>
       <select id="cd-baron" class="text_pole">
@@ -1106,6 +1282,7 @@ function bindPanel() {
     bindCheck('cd-showbar', 'showBar');
     bindCheck('cd-showstage', 'showStage');
     bindCheck('cd-autopresence', 'autoPresence', () => { invalidateTimeline(); redrawAll(); });
+    bindCheck('cd-scenemoves', 'sceneMoves', () => { invalidateTimeline(); redrawAll(); });
 
     bindSelect('cd-baron', 'barOn');
     bindSelect('cd-barsize', 'barSize');
