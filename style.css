@@ -1,0 +1,238 @@
+/* ===== chat rendering ===== */
+
+.mes_text .cd-narr {
+    margin: 8px 0;
+    line-height: 1.5;
+}
+
+.mes_text .cd-spk {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    margin: 10px 0;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border-left: 3px solid var(--cd-color, #9aa7b8);
+    background: rgba(255, 255, 255, 0.045);
+}
+
+.mes_text .cd-pfp,
+.mes_text .cd-spk .cd-noimg {
+    flex: 0 0 auto;
+    width: 62px;
+    height: 86px;
+    object-fit: cover;
+    object-position: top center;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.mes_text .cd-body {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.mes_text .cd-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.mes_text .cd-name {
+    font-size: 1.05em;
+    color: #fff;
+}
+
+.mes_text .cd-tag {
+    font-size: 0.62em;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.10);
+    color: rgba(255, 255, 255, 0.62);
+}
+
+.mes_text .cd-line {
+    color: var(--cd-color, #9aa7b8);
+    line-height: 1.45;
+}
+
+.mes_text .cd-line em,
+.mes_text .cd-line i {
+    color: inherit;
+    opacity: 0.85;
+}
+
+/* attributed quotes inside narration */
+.mes_text .cd-q {
+    color: var(--cd-color, inherit);
+}
+
+/* ===== cast bar ===== */
+
+.mes_text .cd-bar {
+    margin-top: 14px;
+    padding: 12px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.34);
+}
+
+.mes_text .cd-bar-head {
+    font-size: 0.72em;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.55);
+    margin-bottom: 10px;
+}
+
+.mes_text .cd-bar-row {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+}
+
+.mes_text .cd-card {
+    position: relative;
+    flex: 0 0 auto;
+    width: 118px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #000;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.mes_text .cd-card-img,
+.mes_text .cd-card .cd-noimg {
+    display: block;
+    width: 100%;
+    height: 148px;
+    object-fit: cover;
+    object-position: top center;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.mes_text .cd-card-name {
+    display: block;
+    text-align: center;
+    font-size: 0.78em;
+    padding: 5px 2px;
+    color: #ddd;
+    background: rgba(0, 0, 0, 0.6);
+    border-top: 2px solid var(--cd-color, #9aa7b8);
+}
+
+.mes_text .cd-card-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    font-size: 0.66em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.7);
+    color: var(--cd-color, #ddd);
+}
+
+.mes_text .cd-card.cd-absent {
+    opacity: 0.32;
+    filter: grayscale(1);
+}
+
+/* ===== state footer ===== */
+
+.mes_text .cd-state {
+    margin-top: 8px;
+    font-size: 0.78em;
+    letter-spacing: 0.03em;
+    color: rgba(255, 255, 255, 0.4);
+}
+
+/* ===== settings panel ===== */
+
+.cd-settings .cd-buttons {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.cd-settings .cd-hint {
+    display: block;
+    opacity: 0.6;
+    margin-bottom: 8px;
+}
+
+.cd-settings .cd-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.cd-settings .cd-empty {
+    opacity: 0.6;
+    font-size: 0.9em;
+    padding: 6px 0;
+}
+
+.cd-settings .cd-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.cd-settings .cd-row-pfp {
+    flex: 0 0 auto;
+    width: 34px;
+    height: 46px;
+    border-radius: 5px;
+    overflow: hidden;
+    cursor: pointer;
+    background: rgba(0, 0, 0, 0.5);
+}
+
+.cd-settings .cd-row-pfp img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: top center;
+    display: block;
+}
+
+.cd-settings .cd-row-noimg {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.4;
+    font-size: 1.2em;
+}
+
+.cd-settings .cd-row-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.cd-settings .cd-row-color {
+    flex: 0 0 auto;
+    width: 34px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: pointer;
+}
+
+.cd-settings .cd-row-del {
+    flex: 0 0 auto;
+    padding: 2px 9px;
+    line-height: 1.2;
+}
