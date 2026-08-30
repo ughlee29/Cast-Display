@@ -66,13 +66,57 @@ uncolored quote is a much smaller problem than one in the wrong color, so the
 tiers are deliberately conservative. Turn the whole pass off with **Color
 unmarked quotes**.
 
-## [TRACK] is not presence
+## The cast bar
 
-The S value in `[TRACK] Nicole:S6` is whatever your card defines it as -
-relationship stage, affinity, whatever. It is rendered as a badge and never
-greys anyone out, because a state number says nothing about who is in the
-room. For real presence, emit a separate `[PRESENT]` line; only that one
-greys absent characters.
+`[TRACK]` and `[PRESENT]` merge into a single bar at the bottom of the message.
+
+`[TRACK] Nicole:S6 | Ivy:S1` carries state values only. The S number is whatever
+your card defines it as, so it renders as a corner badge and **never** marks
+anyone absent - a state number says nothing about who is in the room.
+
+`[PRESENT] Nicole | Ivy` is the only source of presence. Listed names are in the
+scene; the rest of the cast is faded, hidden, or shown normally per the
+**Absent characters** setting. With no `[PRESENT]` line, nobody is marked absent.
+Presence is never inferred from who happened to speak - someone can sit silently
+in a room for twenty messages.
+
+**Cast bar size** switches between full tiles and a compact row for narrow
+screens. Badges survive both.
+
+## Settings
+
+| Setting | Does |
+|---|---|
+| Color unmarked quotes | Runs the attribution pass |
+| Promote attributed prose | Turns confidently-attributed paragraphs into portrait blocks |
+| Show attribution debug | Labels each quote with the tier that decided it |
+| Cast bar size | Full or Compact |
+| Absent characters | Fade / Hide / Show |
+| Show state badge | The `S` value from `[TRACK]` |
+| Reset this card | Clears all cast entries for the current card |
+
+## Color ownership
+
+Inside any portrait block, quoted dialogue takes the character's color and
+action text stays neutral. So a block containing
+`"Cut him some slack." She beamed at him. "Want tea?"` renders both quotes in
+one color with the action beat in normal text, rather than a mixture.
+
+## Portrait promotion
+
+With **Promote attributed prose** on, a paragraph like
+`Nicole smiled. "You work too hard."` becomes a Nicole portrait block even
+though the model never wrote a `Nicole:` marker.
+
+A blank line ends a paragraph, so each paragraph is attributed and promoted on
+its own. Attribution windows also stop at a line break, so a tag in the next
+paragraph can never be read as belonging to this one.
+
+It promotes only when every quote in the paragraph resolved, all to the same
+name, and at least one by something stronger than carry-over. Two speakers,
+pronoun ambiguity, or a single unresolved quote leaves it as ordinary prose
+with quote coloring. A missing portrait is a much smaller problem than a wrong
+one.
 
 ## Notes
 
