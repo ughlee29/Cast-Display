@@ -12,12 +12,16 @@ const defaults = {
     showTag: true,
     tagText: 'Speaking',
     showBar: true,
-    stateLine: 'dim',      // 'dim' | 'hide' | 'plain'
-    attribute: true,       // color unmarked quotes by local attribution
     barLabel: 'Cast',
-    showStage: true,       // show the S-value badge on [TRACK] cards
-    portraitPx: 256,       // stored portrait width
-    cards: {},             // avatarKey -> { chars: { Name: { color, img } } }
+    barSize: 'full',        // 'full' | 'compact'
+    showStage: true,        // S-value badge from [TRACK]
+    absentMode: 'fade',     // 'fade' | 'hide' | 'show'
+    stateLine: 'dim',       // 'dim' | 'hide' | 'plain'
+    attribute: true,        // color unmarked quotes
+    promote: true,          // turn confidently-attributed prose into portrait blocks
+    debug: false,           // show why each quote was attributed
+    portraitPx: 256,
+    cards: {},              // avatarKey -> { chars: { Name: { color, img } } }
 };
 
 const PALETTE = [
@@ -62,25 +66,29 @@ function addChar(name) {
     return true;
 }
 
+function colorOf(name) {
+    return cast()[name]?.color ?? '#9aa7b8';
+}
+
 // ---------------------------------------------------------------------------
 // patterns
 // ---------------------------------------------------------------------------
 
 const NAME = "[A-Z][\\w'\u2019-]{1,19}";
-const RE_LABEL  = new RegExp(`^(${NAME}):[ \\t]*$`);
-const RE_INLINE = new RegExp(`^(${NAME}):[ \\t]+(["\u201c\u201d].*)$`);
-const RE_TRACK  = /^\[TRACK\][ \t]*(.*)$/;
-const RE_STATE  = /^\[STATE\][ \t]*(.*)$/;
+const RE_LABEL   = new RegExp(`^(${NAME}):[ \\t]*$`);
+const RE_INLINE  = new RegExp(`^(${NAME}):[ \\t]+(["\u201c\u201d].*)$`);
+const RE_TRACK   = /^\[TRACK\][ \t]*(.*)$/;
+const RE_STATE   = /^\[STATE\][ \t]*(.*)$/;
 const RE_PRESENT = /^\[PRESENT\][ \t]*(.*)$/;
-const RE_TOKEN  = new RegExp(`(${NAME}):S(\\d+)`, 'g');
-const RE_ANY    = new RegExp(`^(${NAME}):`, 'gm');
+const RE_TOKEN   = new RegExp(`(${NAME}):S(\\d+)`, 'g');
+const RE_ANY     = new RegExp(`^(${NAME}):`, 'gm');
 
 const NOT_NAMES = new Set([
     'Note', 'Notes', 'Rule', 'Rules', 'Warning', 'Example', 'Examples',
     'Scenario', 'Summary', 'System', 'Setting', 'Location', 'Time',
     'Personality', 'Description', 'Appearance', 'Background', 'Output',
     'Format', 'Instructions', 'You', 'Me', 'I', 'The', 'A', 'An', 'It',
-    'Track', 'State', 'Status', 'Objective', 'Goal', 'Tip',
+    'Track', 'State', 'Status', 'Present', 'Objective', 'Goal', 'Tip',
 ]);
 
 function harvest(text, into) {
@@ -118,7 +126,6 @@ function scanChat() {
     return found;
 }
 
-
 // ---------------------------------------------------------------------------
 // local speaker attribution - render-only, no model call, abstains when unsure
 // ---------------------------------------------------------------------------
@@ -134,7 +141,12 @@ const SAY_VERBS = ['said', 'says', 'replied', 'replies', 'asked', 'asks', 'added
 
 const SOFT_VERBS = ['smiled', 'grinned', 'laughed', 'chuckled', 'shrugged', 'nodded',
     'frowned', 'hummed', 'snorted', 'blinked', 'glanced', 'looked', 'turned', 'leaned',
-    'paused', 'shook', 'tilted', 'raised', 'lowered', 'crossed'];
+    'paused', 'shook', 'tilted', 'raised', 'lowered', 'crossed', 'beamed', 'winced',
+    // common action beats that carry dialogue in practice
+    'set', 'put', 'placed', 'reached', 'stood', 'sat', 'rose', 'stepped', 'moved',
+    'pulled', 'pushed', 'opened', 'closed', 'wiped', 'folded', 'tucked', 'brushed',
+    'tapped', 'waved', 'pointed', 'gestured', 'hesitated', 'exhaled', 'swallowed',
+    'straightened', 'settled', 'dropped', 'lifted', 'took', 'walked', 'turned'];
 
 const ALL_VERBS = SAY_VERBS.concat(SOFT_VERBS);
 const RE_QUOTE = /["\u201c]([^"\u201c\u201d]{1,800}?)["\u201d]/g;
@@ -189,32 +201,51 @@ function pick(frag, names, verbs, mustLead) {
 }
 
 /**
+ * A tag sitting immediately before the quote, as in `Nicole said, "..."`.
+ * Prose convention binds an adjacent tag to its own quote, so this outranks a
+ * trailing tag - otherwise `Nicole said, "Hi." Alice replied, "Bye."` reads
+ * Alice's tag as belonging to Nicole's line.
+ */
+function pickTight(frag, names) {
+    const vs = SAY_VERBS.join('|');
+    const found = names.filter(n => new RegExp(
+        `\\b${escRe(n)}\\b(?:\\s+\\w+){0,2}\\s+(?:${vs})\\s*[,:\u2014-]?\\s*$`, 'i').test(frag));
+    return found.length === 1 ? found[0] : null;
+}
+
+/**
  * Decide who owns a quote. Tiers run most to least reliable and every tier
  * abstains on ambiguity, so an uncertain quote stays uncolored rather than
- * being attributed to the wrong character.
+ * being attributed to the wrong character. Returns { name, why } or null.
  */
 function attributeQuote(flat, start, end, names, lastSpeaker, prevEnd) {
-    // tier 1: trailing tag - "..." Nicole replied. / "..." said Nicole.
-    const after = flat.slice(end, end + 90).split(/(?<=[.!?])\s/)[0];
-    // count candidates after the subject test, so "Ivy whispered to Alice"
-    // still resolves to Ivy rather than abstaining on two names in range
-    let who = pick(after, names, SAY_VERBS, false)
-        // soft verb only trusted when the name leads: "..." Alice snorted.
-        || pick(after, names, ALL_VERBS, true);
-    if (who) return who;
+    // both windows stop at a paragraph break: a tag in the next paragraph
+    // belongs to that paragraph, never to this quote
+    const rawBefore = flat.slice(Math.max(prevEnd, start - 140), start);
+    const before = rawBefore.slice(rawBefore.lastIndexOf('\n') + 1);
+    let who = pickTight(before, names);
+    if (who) return { name: who, why: 'leading tag' };
 
-    // tier 2: leading tag - Nicole said, "..."
-    const before = flat.slice(Math.max(prevEnd, start - 140), start);
-    who = pick(before, names, SAY_VERBS, false)
-        // tier 3: action beat, still requiring subject position
-        || pick(before, names, ALL_VERBS, false);
-    if (who) return who;
+    const after = flat.slice(end, end + 90).split('\n')[0].split(/(?<=[.!?])\s/)[0];
+    who = pick(after, names, SAY_VERBS, false);
+    if (who) return { name: who, why: 'trailing tag' };
+    who = pick(after, names, ALL_VERBS, true);
+    if (who) return { name: who, why: 'trailing beat' };
 
-    // tier 4: continuation - no cast name at all since the last attributed quote
-    if (lastSpeaker && namesIn(before, names).length === 0 && before.trim().length < 140) return lastSpeaker;
+    who = pick(before, names, SAY_VERBS, false);
+    if (who) return { name: who, why: 'leading tag' };
+    who = pick(before, names, ALL_VERBS, false);
+    if (who) return { name: who, why: 'action beat' };
 
+    if (lastSpeaker && namesIn(before, names).length === 0 && before.trim().length < 140) {
+        return { name: lastSpeaker, why: 'continuation' };
+    }
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// DOM helpers
+// ---------------------------------------------------------------------------
 
 function flatten(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -229,7 +260,8 @@ function flatten(root) {
 }
 
 /** Wrap a flat-text range, splitting across element boundaries as needed. */
-function wrapRange(map, start, end, color) {
+function wrapRange(map, start, end, color, label) {
+    let first = null;
     for (let i = map.length - 1; i >= 0; i--) {
         const node = map[i].node;
         const ns = map[i].start;
@@ -245,36 +277,26 @@ function wrapRange(map, start, end, color) {
         span.style.setProperty('--cd-color', color);
         mid.parentNode.insertBefore(span, mid);
         span.appendChild(mid);
+        first = span;
     }
+    if (label && first) {
+        const tag = document.createElement('span');
+        tag.className = 'cd-dbg';
+        tag.textContent = label;
+        first.parentNode.insertBefore(tag, first.nextSibling);
+    }
+    return first;
 }
 
-function attributeQuotes(root) {
-    const s = settings();
-    if (!s.attribute) return;
-    const names = Object.keys(cast());
-    if (!names.length) return;
-
-    root.querySelectorAll('.cd-narr').forEach(block => {
-        const { text, map } = flatten(block);
-        const found = [];
-        let last = null;
-        let prevEnd = 0;
-        let m;
-        RE_QUOTE.lastIndex = 0;
-        while ((m = RE_QUOTE.exec(text)) !== null) {
-            const start = m.index;
-            const end = start + m[0].length;
-            const who = attributeQuote(text, start, end, names, last, prevEnd);
-            found.push({ start, end, who });
-            if (who) last = who;
-            prevEnd = end;
-        }
-        // reverse order keeps earlier offsets valid while the DOM mutates
-        for (let i = found.length - 1; i >= 0; i--) {
-            const f = found[i];
-            if (f.who) wrapRange(map, f.start, f.end, cast()[f.who]?.color ?? '#9aa7b8');
-        }
-    });
+/** Color every quote in `root` with one fixed color. Used inside explicit blocks. */
+function colorAllQuotes(root, color) {
+    const { text, map } = flatten(root);
+    const spans = [];
+    let m;
+    RE_QUOTE.lastIndex = 0;
+    while ((m = RE_QUOTE.exec(text)) !== null) spans.push([m.index, m.index + m[0].length]);
+    for (let i = spans.length - 1; i >= 0; i--) wrapRange(map, spans[i][0], spans[i][1], color, null);
+    return spans.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,63 +321,90 @@ function portrait(name, cls) {
     return `<div class="${cls} cd-noimg"></div>`;
 }
 
-function speakerBlock(name, line, mesId) {
+function speakerHead(name, why) {
     const s = settings();
-    const color = cast()[name]?.color ?? '#9aa7b8';
     const tag = s.showTag ? `<span class="cd-tag">${esc(s.tagText)}</span>` : '';
-    return `<div class="cd-spk" style="--cd-color:${esc(color)}">`
+    const dbg = (s.debug && why) ? `<span class="cd-dbg">${esc(why)}</span>` : '';
+    return `<div class="cd-head"><b class="cd-name">${esc(name)}</b>${tag}${dbg}</div>`;
+}
+
+function speakerBlock(name, line, mesId) {
+    return `<div class="cd-spk" data-who="${esc(name)}" style="--cd-color:${esc(colorOf(name))}">`
         + portrait(name, 'cd-pfp')
-        + `<div class="cd-body"><div class="cd-head"><b class="cd-name">${esc(name)}</b>${tag}</div>`
+        + `<div class="cd-body">${speakerHead(name, 'explicit marker')}`
         + `<div class="cd-line">${fmt(line, mesId)}</div></div></div>`;
 }
 
-function castCard(name, badge, absent) {
-    const color = cast()[name]?.color ?? '#9aa7b8';
-    return `<div class="cd-card${absent ? ' cd-absent' : ''}" style="--cd-color:${esc(color)}">`
+function castCard(name, badge, faded) {
+    return `<div class="cd-card${faded ? ' cd-absent' : ''}" style="--cd-color:${esc(colorOf(name))}">`
         + portrait(name, 'cd-card-img')
         + (badge ? `<span class="cd-card-badge">${esc(badge)}</span>` : '')
         + `<span class="cd-card-name">${esc(name)}</span></div>`;
 }
 
-/**
- * [TRACK] carries per-character state values, NOT presence - the S number is
- * whatever the card defines it as, so it renders as a badge and never greys
- * anyone out. Real presence comes from an explicit [PRESENT] line.
- */
-function trackBar(payload) {
-    const s = settings();
-    if (!s.showBar) return '';
-    const cards = [];
-    let m;
-    RE_TOKEN.lastIndex = 0;
-    while ((m = RE_TOKEN.exec(payload)) !== null) {
-        cards.push(castCard(m[1], s.showStage ? `S${m[2]}` : '', false));
+/** Collect [TRACK] state values and the [PRESENT] roster from a whole message. */
+function scanMarkers(lines) {
+    const track = [];
+    let present = null;
+    const valid = new RegExp(`^${NAME}$`);
+    for (const raw of lines) {
+        const t = raw.trim();
+        let m = t.match(RE_TRACK);
+        if (m) {
+            let k;
+            RE_TOKEN.lastIndex = 0;
+            while ((k = RE_TOKEN.exec(m[1])) !== null) track.push({ name: k[1], s: k[2] });
+            continue;
+        }
+        m = t.match(RE_PRESENT);
+        if (m) {
+            present = m[1].split(/[|,]/).map(x => x.trim()).filter(x => valid.test(x));
+        }
     }
-    if (!cards.length) return '';
-    return `<div class="cd-bar"><div class="cd-bar-head">${esc(s.barLabel)}</div>`
-        + `<div class="cd-bar-row">${cards.join('')}</div></div>`;
+    return { track, present };
 }
 
-/** [PRESENT] Nicole | Ivy - listed names are in the scene, the rest grey out. */
-function presentBar(payload) {
+/**
+ * One bar merging both signals. [TRACK] supplies state badges only - it says
+ * nothing about who is in the room. Presence comes solely from [PRESENT]; with
+ * no such line, nobody is marked absent rather than presence being guessed.
+ */
+function buildBar(track, present) {
     const s = settings();
     if (!s.showBar) return '';
-    const valid = new RegExp(`^${NAME}$`);
-    const listed = payload.split(/[|,]/).map(x => x.trim()).filter(x => valid.test(x));
-    if (!listed.length) return '';
-    const here = new Set(listed);
-    const rest = Object.keys(cast()).filter(n => !here.has(n));
-    const cards = listed.map(n => castCard(n, '', false))
-        .concat(rest.map(n => castCard(n, '', true)));
-    return `<div class="cd-bar"><div class="cd-bar-head">Present Characters</div>`
+
+    const stage = new Map(track.map(t => [t.name, t.s]));
+    const here = present ? new Set(present) : null;
+
+    const order = [];
+    const push = n => { if (!order.includes(n)) order.push(n); };
+    track.forEach(t => push(t.name));
+    (present ?? []).forEach(push);
+    if (here) Object.keys(cast()).forEach(push);
+    if (!order.length) return '';
+
+    const cards = [];
+    for (const n of order) {
+        const absent = here ? !here.has(n) : false;
+        if (absent && s.absentMode === 'hide') continue;
+        const badge = (s.showStage && stage.has(n)) ? `S${stage.get(n)}` : '';
+        cards.push(castCard(n, badge, absent && s.absentMode === 'fade'));
+    }
+    if (!cards.length) return '';
+
+    const label = here ? 'Present Characters' : s.barLabel;
+    const cls = s.barSize === 'compact' ? ' cd-compact' : '';
+    return `<div class="cd-bar${cls}"><div class="cd-bar-head">${esc(label)}</div>`
         + `<div class="cd-bar-row">${cards.join('')}</div></div>`;
 }
 
 function build(raw, mesId) {
     const s = settings();
     const lines = String(raw).split(/\r?\n/);
+    const markers = scanMarkers(lines);
     const out = [];
     let buf = [];
+    let barDone = false;
 
     const flush = () => {
         const text = buf.join('\n').trim();
@@ -367,13 +416,22 @@ function build(raw, mesId) {
         const line = lines[i];
         const trimmed = line.trim();
 
-        let m = trimmed.match(RE_TRACK);
-        if (m) { flush(); out.push(trackBar(m[1])); continue; }
+        // paragraph boundary: without this, one narration block spans several
+        // paragraphs, letting attribution reach across and blocking promotion
+        // whenever the paragraphs have different speakers
+        if (!trimmed) { flush(); continue; }
 
-        m = trimmed.match(RE_PRESENT);
-        if (m) { flush(); out.push(presentBar(m[1])); continue; }
+        if (RE_TRACK.test(trimmed) || RE_PRESENT.test(trimmed)) {
+            flush();
+            if (!barDone) {
+                const bar = buildBar(markers.track, markers.present);
+                if (bar) out.push(bar);
+                barDone = true;
+            }
+            continue;
+        }
 
-        m = trimmed.match(RE_STATE);
+        let m = trimmed.match(RE_STATE);
         if (m) {
             flush();
             if (s.stateLine === 'hide') continue;
@@ -387,7 +445,6 @@ function build(raw, mesId) {
 
         m = trimmed.match(RE_LABEL);
         if (m && cast()[m[1]]) {
-            // label on its own line: the next non-empty line is the dialogue
             let j = i + 1;
             while (j < lines.length && !lines[j].trim()) j++;
             if (j < lines.length) {
@@ -404,6 +461,80 @@ function build(raw, mesId) {
     return out.join('');
 }
 
+// ---------------------------------------------------------------------------
+// post-render passes
+// ---------------------------------------------------------------------------
+
+/** Inside an explicit block: quotes take the speaker's color, action text stays neutral. */
+function paintExplicit(root) {
+    root.querySelectorAll('.cd-spk').forEach(spk => {
+        const name = spk.dataset.who;
+        if (!name) return;
+        const line = spk.querySelector('.cd-line');
+        if (!line) return;
+        // no quotes at all means the whole line is dialogue
+        if (colorAllQuotes(line, colorOf(name)) === 0) line.classList.add('cd-line-all');
+    });
+}
+
+/** Turn a narration block into a portrait block, keeping its existing markup. */
+function promoteBlock(block, name, why) {
+    const wrap = document.createElement('div');
+    wrap.className = 'cd-spk';
+    wrap.dataset.who = name;
+    wrap.style.setProperty('--cd-color', colorOf(name));
+    wrap.innerHTML = portrait(name, 'cd-pfp') + `<div class="cd-body">${speakerHead(name, why)}</div>`;
+    const body = wrap.querySelector('.cd-body');
+    const prose = document.createElement('div');
+    prose.className = 'cd-prose';
+    while (block.firstChild) prose.appendChild(block.firstChild);
+    body.appendChild(prose);
+    block.replaceWith(wrap);
+}
+
+function attributeQuotes(root) {
+    const s = settings();
+    if (!s.attribute) return;
+    const names = Object.keys(cast());
+    if (!names.length) return;
+
+    root.querySelectorAll('.cd-narr').forEach(block => {
+        const { text, map } = flatten(block);
+        const found = [];
+        let last = null;
+        let prevEnd = 0;
+        let m;
+        RE_QUOTE.lastIndex = 0;
+        while ((m = RE_QUOTE.exec(text)) !== null) {
+            const start = m.index;
+            const end = start + m[0].length;
+            const hit = attributeQuote(text, start, end, names, last, prevEnd);
+            found.push({ start, end, hit });
+            if (hit) last = hit.name;
+            prevEnd = end;
+        }
+        if (!found.length) return;
+
+        // reverse order keeps earlier offsets valid while the DOM mutates
+        for (let i = found.length - 1; i >= 0; i--) {
+            const f = found[i];
+            if (!f.hit) continue;
+            const label = s.debug ? `${f.hit.name} \u00b7 ${f.hit.why}` : null;
+            wrapRange(map, f.start, f.end, colorOf(f.hit.name), label);
+        }
+
+        if (!s.promote) return;
+        // promote only when every quote resolved, to one name, and at least one
+        // of them by something stronger than carry-over. A missing portrait is a
+        // far smaller problem than a wrong one.
+        if (found.some(f => !f.hit)) return;
+        const who = new Set(found.map(f => f.hit.name));
+        if (who.size !== 1) return;
+        if (!found.some(f => f.hit.why !== 'continuation')) return;
+        promoteBlock(block, found[0].hit.name, found[0].hit.why);
+    });
+}
+
 function decorate(mesId) {
     const s = settings();
     if (!s.enabled) return;
@@ -418,6 +549,7 @@ function decorate(mesId) {
     if (!html) return;
     el.innerHTML = html;
     attributeQuotes(el);
+    paintExplicit(el);
 }
 
 function redrawAll() {
@@ -479,12 +611,10 @@ function pickImage(name) {
 // ---------------------------------------------------------------------------
 
 function drawPanel() {
-    const s = settings();
-    const key = cardKey();
     const list = document.getElementById('cd-list');
     if (!list) return;
 
-    if (!key) {
+    if (!cardKey()) {
         list.innerHTML = '<div class="cd-empty">Open a character or group chat.</div>';
         return;
     }
@@ -497,9 +627,7 @@ function drawPanel() {
 
     list.innerHTML = names.map(n => {
         const c = cast()[n];
-        const thumb = c.img
-            ? `<img src="${esc(c.img)}" alt="">`
-            : '<div class="cd-row-noimg">+</div>';
+        const thumb = c.img ? `<img src="${esc(c.img)}" alt="">` : '<div class="cd-row-noimg">+</div>';
         return `<div class="cd-row" data-name="${esc(n)}">
             <div class="cd-row-pfp" title="Click to set a portrait">${thumb}</div>
             <div class="cd-row-name">${esc(n)}</div>
@@ -546,9 +674,30 @@ const PANEL = `
     <div class="inline-drawer-content">
       <label class="checkbox_label"><input type="checkbox" id="cd-enabled"> Enabled</label>
       <label class="checkbox_label"><input type="checkbox" id="cd-showtag"> Show speaking tag</label>
+      <label class="checkbox_label"><input type="checkbox" id="cd-attribute"> Color unmarked quotes</label>
+      <label class="checkbox_label"><input type="checkbox" id="cd-promote"> Promote attributed prose to portrait blocks</label>
+      <label class="checkbox_label"><input type="checkbox" id="cd-debug"> Show attribution debug</label>
+
+      <hr>
       <label class="checkbox_label"><input type="checkbox" id="cd-showbar"> Show cast bar</label>
-      <label class="checkbox_label"><input type="checkbox" id="cd-showstage"> Show state badge on cast bar</label>
-      <label class="checkbox_label"><input type="checkbox" id="cd-attribute"> Color unmarked quotes (local attribution)</label>
+      <label class="checkbox_label"><input type="checkbox" id="cd-showstage"> Show state badge</label>
+
+      <label for="cd-barsize">Cast bar size</label>
+      <select id="cd-barsize" class="text_pole">
+        <option value="full">Full</option>
+        <option value="compact">Compact</option>
+      </select>
+
+      <label for="cd-absent">Absent characters</label>
+      <select id="cd-absent" class="text_pole">
+        <option value="fade">Fade</option>
+        <option value="hide">Hide</option>
+        <option value="show">Show</option>
+      </select>
+      <small class="cd-hint">Absence comes only from a [PRESENT] line. Without one, nobody is marked absent.</small>
+
+      <label for="cd-barlabel">Cast bar label</label>
+      <input type="text" id="cd-barlabel" class="text_pole" placeholder="Cast">
 
       <label for="cd-state">[STATE] line</label>
       <select id="cd-state" class="text_pole">
@@ -557,14 +706,12 @@ const PANEL = `
         <option value="plain">Normal text</option>
       </select>
 
-      <label for="cd-barlabel">Cast bar label</label>
-      <input type="text" id="cd-barlabel" class="text_pole" placeholder="Cast">
-
       <hr>
       <div class="cd-buttons">
         <div id="cd-scan-card" class="menu_button">Scan card</div>
         <div id="cd-scan-chat" class="menu_button">Scan chat</div>
         <div id="cd-add" class="menu_button">Add manually</div>
+        <div id="cd-reset" class="menu_button">Reset this card</div>
       </div>
       <small class="cd-hint">Cast is saved per character card, so names never collide between cards.</small>
       <div id="cd-list" class="cd-list"></div>
@@ -572,53 +719,80 @@ const PANEL = `
   </div>
 </div>`;
 
+function bindCheck(id, key, after) {
+    const s = settings();
+    const el = document.getElementById(id);
+    el.checked = s[key];
+    el.addEventListener('change', e => {
+        s[key] = e.target.checked;
+        saveSettingsDebounced();
+        (after ?? redrawAll)();
+    });
+}
+
+function bindSelect(id, key) {
+    const s = settings();
+    const el = document.getElementById(id);
+    el.value = s[key];
+    el.addEventListener('change', e => { s[key] = e.target.value; saveSettingsDebounced(); redrawAll(); });
+}
+
 function bindPanel() {
     const s = settings();
 
-    const en = document.getElementById('cd-enabled');
-    en.checked = s.enabled;
-    en.addEventListener('change', e => {
-        s.enabled = e.target.checked;
-        saveSettingsDebounced();
-        e.target.checked ? redrawAll() : getContext().reloadCurrentChat?.();
+    bindCheck('cd-enabled', 'enabled', () => {
+        if (s.enabled) redrawAll();
+        else getContext().reloadCurrentChat?.();
     });
+    bindCheck('cd-showtag', 'showTag');
+    bindCheck('cd-attribute', 'attribute');
+    bindCheck('cd-promote', 'promote');
+    bindCheck('cd-debug', 'debug');
+    bindCheck('cd-showbar', 'showBar');
+    bindCheck('cd-showstage', 'showStage');
 
-    const tag = document.getElementById('cd-showtag');
-    tag.checked = s.showTag;
-    tag.addEventListener('change', e => { s.showTag = e.target.checked; saveSettingsDebounced(); redrawAll(); });
-
-    const bar = document.getElementById('cd-showbar');
-    bar.checked = s.showBar;
-    bar.addEventListener('change', e => { s.showBar = e.target.checked; saveSettingsDebounced(); redrawAll(); });
-
-    const st = document.getElementById('cd-state');
-    st.value = s.stateLine;
-    st.addEventListener('change', e => { s.stateLine = e.target.value; saveSettingsDebounced(); redrawAll(); });
-
-    const stage = document.getElementById('cd-showstage');
-    stage.checked = s.showStage;
-    stage.addEventListener('change', e => { s.showStage = e.target.checked; saveSettingsDebounced(); redrawAll(); });
-
-    const attr = document.getElementById('cd-attribute');
-    attr.checked = s.attribute;
-    attr.addEventListener('change', e => { s.attribute = e.target.checked; saveSettingsDebounced(); redrawAll(); });
+    bindSelect('cd-barsize', 'barSize');
+    bindSelect('cd-absent', 'absentMode');
+    bindSelect('cd-state', 'stateLine');
 
     const bl = document.getElementById('cd-barlabel');
     bl.value = s.barLabel;
-    bl.addEventListener('change', e => { s.barLabel = e.target.value.trim() || 'Cast'; saveSettingsDebounced(); redrawAll(); });
+    bl.addEventListener('change', e => {
+        s.barLabel = e.target.value.trim() || 'Cast';
+        saveSettingsDebounced();
+        redrawAll();
+    });
 
     document.getElementById('cd-scan-card').addEventListener('click', () => scan('card'));
     document.getElementById('cd-scan-chat').addEventListener('click', () => scan('chat'));
+
     document.getElementById('cd-add').addEventListener('click', async () => {
         if (!cardKey()) { toastr.warning('Open a chat first.'); return; }
-        const name = await getContext().callGenericPopup('Character name', getContext().POPUP_TYPE.INPUT);
-        if (!name) return;
-        const clean = String(name).trim();
+        const ctx = getContext();
+        const name = await ctx.callGenericPopup('Character name', ctx.POPUP_TYPE.INPUT);
+        const clean = String(name ?? '').trim();
         if (!clean) return;
         addChar(clean);
         saveSettingsDebounced();
         drawPanel();
         redrawAll();
+    });
+
+    document.getElementById('cd-reset').addEventListener('click', async () => {
+        const key = cardKey();
+        if (!key) { toastr.warning('Open a chat first.'); return; }
+        const count = Object.keys(cast()).length;
+        if (!count) { toastr.info('Nothing to reset.'); return; }
+        const ctx = getContext();
+        const ok = await ctx.callGenericPopup(
+            `Remove all ${count} cast entries for this card? Portraits and colors are lost.`,
+            ctx.POPUP_TYPE.CONFIRM);
+        if (!ok) return;
+        settings().cards[key] = { chars: {} };
+        saveSettingsDebounced();
+        drawPanel();
+        redrawAll();
+        toastr.info('Cast reset for this card.');
     });
 }
 
