@@ -115,6 +115,8 @@
 }
 
 .mes_text .cd-card {
+    cursor: pointer;
+    transition: opacity 0.15s ease, filter 0.15s ease;
     position: relative;
     flex: 0 0 auto;
     width: 118px;
@@ -162,6 +164,10 @@
 
 .mes_text .cd-card.cd-absent .cd-card-badge {
     opacity: 0.9;
+}
+
+.mes_text .cd-card:hover {
+    border-color: var(--cd-color, rgba(255, 255, 255, 0.4));
 }
 
 /* compact bar for narrow screens */
