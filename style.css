@@ -54,9 +54,18 @@
     color: rgba(255, 255, 255, 0.62);
 }
 
-.mes_text .cd-line {
-    color: var(--cd-color, #9aa7b8);
+.mes_text .cd-line,
+.mes_text .cd-prose {
     line-height: 1.45;
+}
+
+/* fallback: a speaker line with no quotes at all is entirely dialogue */
+.mes_text .cd-line-all {
+    color: var(--cd-color, #9aa7b8);
+}
+
+.mes_text .cd-prose > .cd-narr {
+    margin: 0;
 }
 
 .mes_text .cd-line em,
@@ -65,9 +74,20 @@
     opacity: 0.85;
 }
 
-/* attributed quotes inside narration */
+/* every quote carries its speaker's color; action text stays neutral */
 .mes_text .cd-q {
     color: var(--cd-color, inherit);
+}
+
+.mes_text .cd-dbg {
+    font-size: 0.68em;
+    letter-spacing: 0.04em;
+    opacity: 0.5;
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    white-space: nowrap;
 }
 
 /* ===== cast bar ===== */
@@ -136,8 +156,43 @@
 }
 
 .mes_text .cd-card.cd-absent {
-    opacity: 0.32;
+    opacity: 0.28;
     filter: grayscale(1);
+}
+
+.mes_text .cd-card.cd-absent .cd-card-badge {
+    opacity: 0.9;
+}
+
+/* compact bar for narrow screens */
+.mes_text .cd-bar.cd-compact {
+    padding: 8px;
+}
+
+.mes_text .cd-bar.cd-compact .cd-bar-head {
+    margin-bottom: 6px;
+}
+
+.mes_text .cd-bar.cd-compact .cd-card {
+    width: 62px;
+}
+
+.mes_text .cd-bar.cd-compact .cd-card-img,
+.mes_text .cd-bar.cd-compact .cd-noimg {
+    height: 74px;
+}
+
+.mes_text .cd-bar.cd-compact .cd-card-name {
+    font-size: 0.68em;
+    padding: 3px 1px;
+    border-top-width: 2px;
+}
+
+.mes_text .cd-bar.cd-compact .cd-card-badge {
+    top: 3px;
+    right: 3px;
+    font-size: 0.58em;
+    padding: 1px 4px;
 }
 
 /* ===== state footer ===== */
