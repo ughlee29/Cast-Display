@@ -1,0 +1,21 @@
+name: Reconstruct v1.5.6
+on:
+  push:
+    branches: [release-v1.5.6-staging]
+permissions:
+  contents: write
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and verify index.js
+        shell: bash
+        run: |
+          cat .cast-display-upload/index.b64.* | base64 -d > index.js
+          echo "54267b315a57e2e0559b61fa848f38206a2d755d0cbde0a260ffa303f0b92a57  index.js" | sha256sum -c -
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js
+          git commit -m "Reconstruct Cast Display v1.5.6 index" || exit 0
+          git push
