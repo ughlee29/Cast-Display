@@ -17,8 +17,9 @@ const defaults = {
     showStage: true,        // S-value badge from [TRACK]
     absentMode: 'fade',     // 'fade' | 'hide' | 'show'
     barOn: 'both',          // 'markers' | 'last' | 'both'
-    autoPresence: false,    // read enter/leave from prose
-    sceneMoves: false,      // read scene transitions from prose
+    presenceMode: 'off',    // 'off' | 'prose' | 'locations'
+    autoPresence: false,    // legacy, migrated into presenceMode
+    sceneMoves: false,      // legacy, migrated into presenceMode
     stateLine: 'dim',       // 'dim' | 'hide' | 'plain'
     attribute: true,        // color unmarked quotes
     promote: true,          // turn confidently-attributed prose into portrait blocks
@@ -38,6 +39,12 @@ function settings() {
     const s = extension_settings[MODULE];
     for (const [k, v] of Object.entries(defaults)) {
         if (s[k] === undefined) s[k] = structuredClone(v);
+    }
+    // migrate the old pair of booleans once
+    if (s.presenceMode === 'off' && (s.autoPresence || s.sceneMoves)) {
+        s.presenceMode = 'prose';
+        s.autoPresence = false;
+        s.sceneMoves = false;
     }
     return s;
 }
@@ -381,7 +388,9 @@ function namesIn(text, names) {
  */
 function subjectOf(frag, name, verbs, mustLead, names) {
     const vs = verbs.join('|');
-    const forward = new RegExp(`^[\\s,]*(?:\\w+\\s+){0,3}?(?:${vs})${EDGE_R}`, 'iu');
+    // the skip allows commas so a three-way subject list still reaches its verb:
+    // "Nicole, Ivy, and Alice went to the kitchen"
+    const forward = new RegExp(`^[\\s,]*(?:[\\w'\u2019-]+[\\s,]+){0,3}?(?:${vs})${EDGE_R}`, 'iu');
     const inverted = new RegExp(`${EDGE_L}(?:${vs})\\s+$`, 'iu');
     for (const idx of occurrences(frag, name, names)) {
         const pre = frag.slice(0, idx);
@@ -604,7 +613,12 @@ const MOVE_VERBS = ['followed', 'follows', 'following', 'headed', 'heads', 'walk
     'walks', 'stepped', 'steps', 'moved', 'moves', 'went', 'goes', 'slipped', 'slips',
     'wandered', 'led', 'leads', 'trailed', 'trails', 'rounded', 'rounds', 'rose',
     'rises', 'stood', 'stands', 'slid', 'slides', 'drifted', 'ducked', 'retreated',
-    'withdrew', 'disappeared', 'vanished', 'crossed', 'entered', 'exited', 'left'];
+    'withdrew', 'disappeared', 'vanished', 'crossed', 'entered', 'exited', 'left',
+    'came', 'comes', 'come', 'returned', 'returns', 'arrived', 'arrives',
+    'reached', 'reaches', 'got', 'made', 'strode', 'marched', 'hurried', 'darted',
+    // must stay in step with BARE_ARRIVE_RE or those forms find no mover
+    'appeared', 'appears', 'reappeared', 'reappears',
+    'joined', 'joins', 'rejoined', 'rejoins'];
 
 const SEPARATION_CUES = [
     "out of (?:[\\w'\u2019]+ ){0,6}?(?:sight|earshot|view|hearing)",
@@ -639,9 +653,36 @@ function speakersIn(text, names) {
     return [...out];
 }
 
+/**
+ * Periods inside a cast name are not sentence boundaries. "Mrs. Chen" would
+ * otherwise split into "Mrs." and "Chen ...", losing the name before any of the
+ * movement logic sees it. Masking preserves length, so every index computed on
+ * the masked text still addresses the original.
+ */
+function maskNames(text, names, persona) {
+    let out = String(text);
+    for (const nm of [...(names ?? []), ...(persona ? [persona] : [])]) {
+        if (!nm.includes('.')) continue;
+        out = out.replace(nameRe(nm, 'g'), m => m.replace(/\./g, '\u0001'));
+    }
+    return out;
+}
+
 /** Rough sentence split. Good enough to bound a narrative window. */
-function sentences(text) {
-    return String(text).split(/(?<=[.!?\u2026])\s+|\n+/).filter(s => s.trim());
+function sentences(text, names = [], persona = null) {
+    const masked = maskNames(text, names, persona);
+    const re = /(?<=[.!?\u2026])\s+|\n+/gu;
+    const out = [];
+    let last = 0;
+    let m;
+    while ((m = re.exec(masked)) !== null) {
+        const seg = String(text).slice(last, m.index);
+        if (seg.trim()) out.push(seg);
+        last = m.index + m[0].length;
+    }
+    const tail = String(text).slice(last);
+    if (tail.trim()) out.push(tail);
+    return out;
 }
 
 /**
@@ -680,7 +721,7 @@ function cueBelongsToMovers(sentence, cueIndex, cueLength, movers, names) {
 
 function applyScene(text, away, names) {
     const narration = stripQuotes(text);
-    const sents = sentences(narration);
+    const sents = sentences(narration, names);
 
     // movers must appear in the cue sentence or shortly before it, not merely
     // somewhere in the same message
@@ -758,6 +799,425 @@ function restoreSpeakers(text, away, names) {
     return next;
 }
 
+// --- locations --------------------------------------------------------------
+//
+// Presence is derived, not asserted: a character fades when their location is
+// known and differs from where the scene currently is. Nothing here carries a
+// vocabulary of place names - locations are discovered from the prose, so a
+// bridge, a forest clearing or a dream realm works exactly like a kitchen.
+//
+// Everyone begins in one anonymous bucket together with the camera, and stays
+// where they are until prose moves them. That persistence is the one inference
+// this model makes, and it is a positive, defeasible one.
+
+const SCENE_ZERO = 'scene#0';
+
+/**
+ * Nouns that follow a movement preposition without being places. Body parts and
+ * abstractions only - nothing card-specific, nothing that names a real location.
+ */
+const NON_PLACES = new Set(['arms', 'arm', 'lap', 'chest', 'shoulder', 'shoulders',
+    'hands', 'hand', 'eyes', 'eye', 'face', 'side', 'view', 'sight', 'silence',
+    'place', 'position', 'motion', 'focus', 'mind', 'thoughts', 'thought', 'kiss',
+    'embrace', 'contact', 'direction', 'attention', 'way', 'lead', 'example', 'suit',
+    'feet', 'foot', 'knees', 'air', 'ground', 'moment', 'point', 'edge', 'middle',
+    'centre', 'center', 'distance', 'rest', 'end', 'work', 'life', 'head', 'neck',
+    'lips', 'mouth', 'waist', 'hip', 'hips', 'skin', 'heart', 'memory', 'habit',
+    'routine', 'conversation', 'subject', 'topic', 'question', 'answer', 'sound',
+    'noise', 'light', 'dark', 'darkness', 'warmth', 'cold', 'truth', 'past']);
+
+const MOVE_PREPS = 'into|onto|toward|towards|inside|through|out to|down to|up to|back to|over to|off to|to';
+
+const BARE_PLACES = ['upstairs', 'downstairs', 'outside', 'inside', 'home',
+    'out back', 'next door', 'out front', 'aboard', 'ashore', 'below deck'];
+
+const ARRIVE_VERBS_LOC = 'reached|reaches|entered|enters|arrived at|arrives at|arrived in|arrives in|got to|gets to|made it to|stepped into|walked into';
+
+const ACCOMPANY_RE = /(?:follow(?:ed|ing|s)?|join(?:ed|ing|s)?|accompan\w+|trail(?:ed|ing|s)?\s+after|(?:went|came|walked|headed)\s+with|beside\s+(?:him|her|them)|with\s+(?:him|her|them)|after\s+(?:him|her|them))/iu;
+
+/** First person, second person, or a plural subject: the camera is involved. */
+const CAMERA_RE = /(?<![\p{L}\p{N}])(?:they|them|we|us|our|you|your|i|me|my|both\s+of\s+them|the\s+two\s+of\s+them)(?![\p{L}\p{N}])/iu;
+
+function normLoc(phrase) {
+    return String(phrase).toLowerCase()
+        .replace(/[^\p{L}\p{N}\s'-]/gu, '')
+        .replace(/^(?:the|a|an)\s+/u, '')
+        .replace(/\s+/gu, ' ')
+        .trim();
+}
+
+/**
+ * Two phrases name the same place when one is a word-suffix of the other, so
+ * "the warm kitchen" and "the kitchen" merge while "engine room" and "living
+ * room" stay distinct. The shorter form wins as the canonical name.
+ */
+function canonicalLoc(name, known) {
+    for (const k of known) {
+        if (k === name) return k;
+        if (name.endsWith(' ' + k)) return k;
+        if (k.endsWith(' ' + name)) return name;
+    }
+    return name;
+}
+
+const PHRASE_STOP = new Set(['a', 'an', 'the', 'and', 'or', 'but', 'too', 'also',
+    'with', 'together', 'then', 'again', 'as', 'for', 'to', 'in', 'on', 'at',
+    'from', 'by', 'while', 'when', 'before', 'after', 'so', 'just', 'now', 'still',
+    'that', 'this', 'which', 'who', 'where', 'her', 'his', 'their', 'its', 'my',
+    'your', 'our', 'him', 'them', 'she', 'he', 'they', 'we', 'it', 'was', 'were',
+    'is', 'are', 'had', 'has', 'have', 'would', 'could', 'will', 'not',
+    'alone', 'anyway', 'instead', 'first', 'next', 'last', 'once', 'twice',
+    'behind', 'ahead', 'away', 'off', 'out', 'up', 'down', 'over', 'under']);
+
+
+const MOVE_RE = new RegExp(`(?<![\\p{L}\\p{N}])(?:${MOVE_VERBS.join('|')})(?![\\p{L}\\p{N}])`, 'iu');
+
+/** Clause boundaries. A destination belongs to the clause that moves someone. */
+const CLAUSE_BREAK = /[,.;:!?\u2014]|(?<![\p{L}\p{N}])(?:and|but|then|while|as|before|after|so)(?![\p{L}\p{N}])/giu;
+
+/**
+ * Is this preposition governed by an actual movement verb? Without this check,
+ * "Nicole pointed to the kitchen" and "Nicole glanced toward the kitchen" read
+ * as journeys, and the whole cast fades because somebody looked at a door.
+ */
+/** Conjunctions that contrast rather than continue: the other party did something else. */
+const CONTRASTIVE = /^(?:while|but|whereas|though|although|meanwhile|however|as)$/i;
+
+/**
+ * A fragment made only of cast names and "and" is a coordinated subject, not a
+ * clause. Without this, "Nicole and Alice went to the kitchen" splits and only
+ * Alice travels.
+ */
+function isNameFragment(frag, names, persona) {
+    const words = frag.trim().split(/\s+/)
+        .map(w => w.replace(/[^\p{L}'\u2019-]/gu, ''))
+        .filter(Boolean);
+    if (!words.length || words.length > 4) return false;
+    // compare on bare letters so "Mrs. Chen" matches the tokens "mrs" and "chen"
+    const known = new Set();
+    for (const k of [...names, ...(persona ? [persona] : [])]) {
+        for (const t of k.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '').split(/\s+/)) {
+            if (t) known.add(t);
+        }
+    }
+    return words.every(w => {
+        const lw = w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+        return !lw || /^(?:and|&)$/.test(lw) || known.has(lw);
+    });
+}
+
+/** Split a sentence into clauses, keeping the separator that introduced each. */
+function splitClauses(text, names = [], persona = null) {
+    const parts = [];
+    let last = 0;
+    let sep = '';
+    let m;
+    const masked = maskNames(text, names, persona);
+    CLAUSE_BREAK.lastIndex = 0;
+    while ((m = CLAUSE_BREAK.exec(masked)) !== null) {
+        parts.push({ text: text.slice(last, m.index), start: last, sep });
+        sep = m[0];
+        last = m.index + m[0].length;
+    }
+    parts.push({ text: text.slice(last), start: last, sep });
+
+    const merged = [];
+    for (let i = 0; i < parts.length; i++) {
+        let part = parts[i];
+        while (i < parts.length - 1 && isNameFragment(part.text, names, persona)) {
+            const nxt = parts[i + 1];
+            part = {
+                text: text.slice(part.start, nxt.start + nxt.text.length),
+                start: part.start,
+                sep: part.sep,
+            };
+            i += 1;
+        }
+        merged.push(part);
+    }
+    return merged.filter(p => p.text.trim());
+}
+
+/** Cast members named as companions: "went to the kitchen with Alice". */
+function withNames(clause, names) {
+    return names.filter(nm => new RegExp(
+        `(?:with|alongside|beside|together\\s+with)\\s+(?:\\w+\\s+){0,2}?${EDGE_L}${escRe(nm)}${EDGE_R}`,
+        'iu').test(clause));
+}
+
+/** Third-person plural can corefer with a named character in a nearby clause. */
+const THIRD_PLURAL = /(?<![\p{L}\p{N}])(?:they|them|both|the\s+two\s+of\s+them)(?![\p{L}\p{N}])/iu;
+
+function clauseOf(clauses, idx) {
+    return clauses.find(c => idx >= c.start && idx < c.start + c.text.length) ?? null;
+}
+
+/** The clause containing `idx`, bounded by punctuation or a conjunction. */
+function clauseAround(text, idx, names = [], persona = null) {
+    const masked = maskNames(text, names, persona);
+    let start = 0;
+    let end = text.length;
+    let m;
+    CLAUSE_BREAK.lastIndex = 0;
+    while ((m = CLAUSE_BREAK.exec(masked)) !== null) {
+        const s = m.index;
+        const e = s + m[0].length;
+        if (e <= idx) start = e;
+        else if (s > idx) { end = s; break; }
+    }
+    return text.slice(start, end);
+}
+
+function boundToMovement(text, prepIndex, names = [], persona = null) {
+    const back = maskNames(text, names, persona).slice(0, prepIndex);
+    let cut = -1;
+    let m;
+    CLAUSE_BREAK.lastIndex = 0;
+    while ((m = CLAUSE_BREAK.exec(back)) !== null) cut = m.index + m[0].length;
+    return MOVE_RE.test(String(text).slice(0, prepIndex).slice(cut + 1));
+}
+
+/**
+ * Read a place phrase after a determiner. Stops at the first function word or
+ * punctuation, and restarts after "of the" so "the edge of the forest clearing"
+ * yields the clearing rather than the edge.
+ *
+ * With no determiner, a capitalised 1-3 word run is accepted instead, which is
+ * how Khar Veldun, Rivendell and Deck Seven become locations. Cast names and
+ * the user persona are excluded, so "walked over to Alice" is not a place.
+ */
+function takePhrase(text, from, names, persona) {
+    const rest = text.slice(from);
+    const det = /^\s+(?:the|a|an)\s+/iu.exec(rest);
+
+    if (!det) {
+        const proper = /^\s+((?:\p{Lu}[\p{L}'-]*)(?:\s+(?:\p{Lu}[\p{L}'-]*|of|the)){0,2})/u.exec(rest);
+        if (!proper) return null;
+        const words = proper[1].split(/\s+/).filter(w => /^\p{Lu}/u.test(w) || /^(?:of|the)$/i.test(w));
+        while (words.length && /^(?:of|the)$/i.test(words[words.length - 1])) words.pop();
+        if (!words.length) return null;
+        const display = words.join(' ');
+        const key = normLoc(display);
+        if (!key || NON_PLACES.has(key.split(' ').pop())) return null;
+        const blocked = [...(names ?? []), ...(persona ? [persona] : [])];
+        if (blocked.some(b => occurrences(display, b, blocked).length > 0)) return null;
+        if (words.some(w => NOT_NAMES.has(w))) return null;
+        return { key, display };
+    }
+
+    const tokens = rest.slice(det[0].length).split(/\s+/);
+    const words = [];
+    for (let i = 0; i < tokens.length && words.length < 3; i++) {
+        const raw = tokens[i].replace(/[^\p{L}'-]/gu, '').toLowerCase();
+        if (!raw) break;
+        const nextDet = (tokens[i + 1] || '').replace(/[^\p{L}]/gu, '').toLowerCase();
+        if (raw === 'of' && ['the', 'a', 'an'].includes(nextDet)) {
+            words.length = 0;
+            i += 1;
+            continue;
+        }
+        if (PHRASE_STOP.has(raw)) break;
+        // trailing adverbs are not part of a place name
+        if (raw.length > 4 && raw.endsWith('ly')) break;
+        if (!/^\p{Ll}/u.test(raw)) break;
+        words.push(raw);
+        if (/[,.;:!?\u2014]$/u.test(tokens[i])) break;
+    }
+    if (!words.length) return null;
+    const key = normLoc(words.join(' '));
+    if (!key || NON_PLACES.has(key.split(' ').pop())) return null;
+    return { key, display: key };
+}
+
+/**
+ * Destinations. `bind` requires the preposition to sit in a movement clause;
+ * positional phrases used only to name an unnamed opening scene skip that.
+ */
+function placeCandidates(text, preps, names, persona, bind) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${preps})(?![\\p{L}\\p{N}])`, 'giu');
+    const out = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        if (bind && !boundToMovement(text, m.index, names, persona)) continue;
+        const hit = takePhrase(text, m.index + m[0].length, names, persona);
+        if (hit) out.push({ ...hit, index: m.index });
+    }
+    return out;
+}
+
+function arrivalPlaces(text, names, persona) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${ARRIVE_VERBS_LOC})(?![\\p{L}\\p{N}])`, 'giu');
+    const out = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const hit = takePhrase(text, m.index + m[0].length, names, persona);
+        if (hit) out.push({ ...hit, index: m.index });
+    }
+    return out;
+}
+
+/**
+ * Bare directions are destinations only inside a movement clause. "You went
+ * upstairs" is travel; "You hear Alice upstairs" and "They looked downstairs"
+ * are not, and treating them as travel would move the whole scene.
+ */
+function barePlaces(text, names = [], persona = null) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}])(${BARE_PLACES.join('|')})(?![\\p{L}\\p{N}])`, 'giu');
+    const out = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        if (!boundToMovement(text, m.index, names, persona)) continue;
+        const key = normLoc(m[1]);
+        out.push({ key, display: key, index: m.index });
+    }
+    return out;
+}
+
+/** Coming back puts you where the scene is, not somewhere new. */
+const RETURN_RE = /(?:came?\s+back|went\s+back|head(?:ed|s)?\s+back|return(?:ed|s)?|rejoin(?:ed|s)?|back\s+(?:in|into|to|down|up))/iu;
+
+/**
+ * Arrival into the current scene with no destination named - a return, or an
+ * intransitive "walked in". Only counts when the verb takes no object, so
+ * "Nicole returned." is movement and "Nicole returned the book." is not.
+ */
+const BARE_ARRIVE_RE = new RegExp(
+    '(?:came?\\s+back|went\\s+back|head(?:ed|s)?\\s+back|return(?:ed|s)|rejoin(?:ed|s)?'
+    + '|(?:walked|stepped|came|strode|wandered|slipped|ducked|moved)\\s+in'
+    + '|enter(?:ed|s)'
+    + '|(?:re)?appear(?:ed|s)(?=\\s*[.,;:!?]|\\s+(?:in|at|from|beside|next|again)(?![\\p{L}\\p{N}])|$)'
+    + '|join(?:ed|s)?\\s+(?:them|us))'
+    + '(?!\\s+(?:the|a|an|his|her|their|my|your|our|its|this|that|some|both|it|him|them|me|us)(?![\\p{L}\\p{N}]))',
+    'iu');
+
+/** Prose that says someone did not travel: "while Alice stayed behind". */
+const STAY_RE = /(?:stay(?:ed|s|ing)?|remain(?:ed|s|ing)?|linger(?:ed|s|ing)?|hung\s+back|held\s+back|didn'?t\s+(?:follow|move|budge)|kept\s+(?:her|his|their)\s+(?:seat|place))/iu;
+
+/** Explicitly solitary movement: the scene really can hold none of the cast. */
+const ALONE_RE = /(?<![\p{L}\p{N}])(?:alone|by\s+(?:my|him|her|them|our)self|by\s+themselves|on\s+(?:my|his|her|their)\s+own|without\s+(?:them|her|him|the\s+others))(?![\p{L}\p{N}])/iu;
+
+function blankLocState() {
+    return { scene: SCENE_ZERO, at: new Map(), known: new Set(), labels: new Map() };
+}
+
+function cloneLocState(s) {
+    return {
+        scene: s.scene,
+        at: new Map(s.at),
+        known: new Set(s.known),
+        labels: new Map(s.labels ?? []),
+    };
+}
+
+function advanceLocations(state, text, names, persona) {
+    const next = cloneLocState(state);
+    const narration = stripQuotes(text);
+    let cameraSignal = false;
+    let solitary = false;
+
+    for (const sent of sentences(narration, names, persona)) {
+        const hits = arrivalPlaces(sent, names, persona)
+            .concat(placeCandidates(sent, MOVE_PREPS, names, persona, true))
+            .concat(barePlaces(sent, names, persona));
+
+        if (!hits.length) {
+            // "Nicole came back." - a return with no destination means the scene
+            if (BARE_ARRIVE_RE.test(sent) && !REMOTE_RE.test(sent)) {
+                const back = names.filter(n => subjectOf(sent, n, MOVE_VERBS, false, names));
+                for (const n of back) next.at.set(n, next.scene);
+                if (back.length) continue;
+            }
+            // The opening bucket stays anonymous. "Nicole smiled at the
+            // painting" is not evidence that the scene is called "painting",
+            // and naming it from any positional phrase produced nonsense
+            // locations. Only real movement establishes a place.
+            continue;
+        }
+
+        // Movement is clause-scoped. Two people going to two places in one
+        // sentence are two events, and a mover only reaches the destination
+        // named in their own clause.
+        hits.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        const clauses = splitClauses(sent, names, persona);
+
+        for (const c of clauses) {
+            const cEnd = c.start + c.text.length;
+            const inClause = hits.filter(h => (h.index ?? 0) >= c.start && (h.index ?? 0) < cEnd);
+            if (!inClause.length) continue;
+
+            const hit = inClause[inClause.length - 1];
+            let dest = canonicalLoc(hit.key, next.known);
+            if (RETURN_RE.test(c.text) && !next.known.has(dest)) dest = next.scene;
+            next.known.add(dest);
+            if (!next.labels.has(dest)) next.labels.set(dest, hit.display);
+            if (ALONE_RE.test(c.text)) solitary = true;
+
+            const companions = withNames(c.text, names);
+            const movers = names.filter(nm =>
+                subjectOf(c.text, nm, MOVE_VERBS, false, names) || companions.includes(nm));
+            const personaMoved = persona && subjectOf(c.text, persona, MOVE_VERBS, false, [persona]);
+            const cameraMoved = personaMoved || ACCOMPANY_RE.test(c.text) || CAMERA_RE.test(c.text);
+
+            for (const nm of movers) next.at.set(nm, dest);
+            if (!cameraMoved) continue;
+
+            cameraSignal = true;
+            next.scene = dest;
+
+            // Whoever is acting in this clause travelled with the camera.
+            let carry = STAY_RE.test(c.text) ? [] : namesIn(c.text, names);
+            // The clause that moves the camera often names nobody - the actors
+            // sit in a neighbouring clause. Reaching into that clause needs
+            // real evidence, not just a friendly connector: either the camera
+            // subject was a third-person plural that can corefer with them, or
+            // their own clause shows movement or accompaniment. Otherwise
+            // "We went to the kitchen and Alice watched TV" drags Alice along.
+            const anaphoric = THIRD_PLURAL.test(c.text);
+            if (!carry.length) {
+                carry = names.filter(nm => {
+                    const idx = occurrences(sent, nm, names)[0];
+                    if (idx === undefined) return false;
+                    const own = clauseOf(clauses, idx);
+                    if (!own || own === c) return false;
+                    if (CONTRASTIVE.test((own.sep || '').trim())) return false;
+                    if (STAY_RE.test(own.text)) return false;
+                    return anaphoric || MOVE_RE.test(own.text) || ACCOMPANY_RE.test(own.text);
+                });
+            }
+            for (const nm of carry) next.at.set(nm, dest);
+        }
+    }
+
+    // If nobody moved the camera and the scene has emptied anyway, the camera
+    // most likely travelled undescribed. Never applied when the prose actually
+    // said where the camera went, or said someone went somewhere alone.
+    if (!cameraSignal && !solitary && names.length
+        && names.every(n => (next.at.get(n) ?? SCENE_ZERO) !== next.scene)) {
+        const counts = new Map();
+        for (const n of names) {
+            const at = next.at.get(n) ?? SCENE_ZERO;
+            counts.set(at, (counts.get(at) ?? 0) + 1);
+        }
+        const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        if (ranked.length === 1 || ranked[0][1] > ranked[1][1]) next.scene = ranked[0][0];
+    }
+    return next;
+}
+
+function awayFromLocations(state, names) {
+    const out = new Set();
+    for (const n of names) {
+        if ((state.at.get(n) ?? SCENE_ZERO) !== state.scene) out.add(n);
+    }
+    return out;
+}
+
+function locLabel(state, name) {
+    const at = state?.at?.get(name);
+    if (!at || at === SCENE_ZERO || at === state.scene) return '';
+    return state.labels?.get(at) ?? at;
+}
+
 let timelineCache = { key: null, data: [] };
 
 function invalidateTimeline() {
@@ -773,35 +1233,70 @@ function timeline() {
     const chat = getContext().chat ?? [];
     const ov = presenceStore();
     const names = Object.keys(cast());
-    const key = [chatKey(), chat.length, s.autoPresence, s.sceneMoves, names.join(','), JSON.stringify(ov)].join('|');
+    const key = [chatKey(), chat.length, s.presenceMode, names.join(','), JSON.stringify(ov)].join('|');
     if (timelineCache.key === key) return timelineCache.data;
 
+    const persona = getContext().name1 || null;
     const data = [];
+    const locs = [];
     let away = null;
+    let loc = blankLocState();
+
     for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
         if (msg && !msg.is_user && !msg.is_system) {
             const listed = markerRoster(msg.mes);
             if (listed) {
+                // an explicit marker is authoritative and resets the model with it
                 away = new Set(names.filter(n => !listed.includes(n)));
-            } else if (s.autoPresence) {
+                if (s.presenceMode === 'locations') {
+                    for (const n of names) {
+                        if (listed.includes(n)) loc.at.set(n, loc.scene);
+                        else if ((loc.at.get(n) ?? SCENE_ZERO) === loc.scene) loc.at.delete(n);
+                    }
+                }
+            } else if (s.presenceMode === 'locations') {
+                loc = advanceLocations(loc, msg.mes, names, persona);
+                // A restore has to move the character, not just edit the derived
+                // set - otherwise the next message re-derives from a stale
+                // location and fades them straight back out.
+                const remote = remoteSpeakers(msg.mes, names);
+                for (const n of speakersIn(msg.mes, names)) {
+                    if (!remote.has(n)) loc.at.set(n, loc.scene);
+                }
+                away = awayFromLocations(loc, names);
+            } else if (s.presenceMode === 'prose') {
                 let next = applyProse(msg.mes, away ? new Set(away) : null, names);
-                if (s.sceneMoves) next = applyScene(msg.mes, next ?? (away ? new Set(away) : null), names);
+                next = applyScene(msg.mes, next ?? (away ? new Set(away) : null), names);
                 next = restoreSpeakers(msg.mes, next ?? away, names);
                 if (next) away = next;
             }
         }
         // a tap at this message outranks whatever the message itself claimed
-        if (ov && ov.since === i) away = new Set(ov.away);
+        if (ov && ov.since === i) {
+            away = new Set(ov.away);
+            if (s.presenceMode === 'locations') {
+                for (const n of names) {
+                    if (away.has(n)) { if ((loc.at.get(n) ?? SCENE_ZERO) === loc.scene) loc.at.delete(n); }
+                    else loc.at.set(n, loc.scene);
+                }
+            }
+        }
         data.push(away ? new Set(away) : null);
+        locs.push(cloneLocState(loc));
     }
-    timelineCache = { key, data };
+    timelineCache = { key, data, locs };
     return data;
 }
 
 function awayAt(idx) {
     const t = timeline();
     return t[idx] ?? null;
+}
+
+function locAt(idx) {
+    timeline();
+    return timelineCache.locs?.[idx] ?? null;
 }
 
 function toggleAway(name) {
@@ -850,13 +1345,15 @@ function speakerBlock(name, line, mesId) {
         + `<div class="cd-line">${fmt(line, mesId)}</div></div></div>`;
 }
 
-function castCard(name, badge, faded) {
+function castCard(name, badge, faded, where) {
     return `<div class="cd-card${faded ? ' cd-absent' : ''}" data-name="${esc(name)}"`
         + ` title="Tap to mark ${esc(name)} ${faded ? 'present' : 'away'}"`
         + ` style="--cd-color:${esc(colorOf(name))}">`
         + portrait(name, 'cd-card-img')
         + (badge ? `<span class="cd-card-badge">${esc(badge)}</span>` : '')
-        + `<span class="cd-card-name">${esc(name)}</span></div>`;
+        + `<span class="cd-card-name">${esc(name)}</span>`
+        + (where ? `<span class="cd-card-loc">${esc(where)}</span>` : '')
+        + `</div>`;
 }
 
 /** Collect [TRACK] state values and the [PRESENT] roster from a whole message. */
@@ -884,7 +1381,7 @@ function scanMarkers(lines) {
  * nothing about who is in the room. Presence comes solely from [PRESENT]; with
  * no such line, nobody is marked absent rather than presence being guessed.
  */
-function buildBar(track, away) {
+function buildBar(track, away, loc) {
     const s = settings();
     if (!s.showBar) return '';
 
@@ -900,7 +1397,7 @@ function buildBar(track, away) {
         const absent = away ? away.has(n) : false;
         if (absent && s.absentMode === 'hide') continue;
         const badge = (s.showStage && stage.has(n)) ? `S${stage.get(n)}` : '';
-        cards.push(castCard(n, badge, absent && s.absentMode === 'fade'));
+        cards.push(castCard(n, badge, absent && s.absentMode === 'fade', locLabel(loc, n)));
     }
     if (!cards.length) return '';
 
@@ -915,6 +1412,7 @@ function build(raw, mesId, isLast) {
     const lines = String(raw).split(/\r?\n/);
     const markers = scanMarkers(lines);
     const away = awayAt(mesId);
+    const loc = locAt(mesId);
     const out = [];
     let buf = [];
     let barDone = false;
@@ -937,7 +1435,7 @@ function build(raw, mesId, isLast) {
         if (RE_TRACK.test(trimmed) || RE_PRESENT.test(trimmed)) {
             flush();
             if (!barDone && s.barOn !== 'last') {
-                const bar = buildBar(markers.track, away);
+                const bar = buildBar(markers.track, away, loc);
                 if (bar) out.push(bar);
                 barDone = true;
             }
@@ -975,7 +1473,7 @@ function build(raw, mesId, isLast) {
 
     // markerless cards still get a bar: pin one to the newest message
     if (!barDone && isLast && s.barOn !== 'markers') {
-        const bar = buildBar(markers.track, away);
+        const bar = buildBar(markers.track, away, loc);
         if (bar) out.push(bar);
     }
     return out.join('');
@@ -1012,14 +1510,50 @@ function promoteBlock(block, name, why) {
     block.replaceWith(wrap);
 }
 
+const ANCHOR_PRONOUN = /(?<![\p{L}\p{N}])(?:she|he|her|his|him|they|them|their)(?![\p{L}\p{N}])/iu;
+
+/** How many pronoun-only paragraphs an anchor may survive. */
+const MAX_CARRY = 3;
+
+/**
+ * Is `name` acting in this paragraph? Accepts the possessive subject form too,
+ * since "Nicole's brows lifted" establishes Nicole just as well as
+ * "Nicole lifted her brows". Used only to set the carry anchor, never to
+ * attribute a quote directly.
+ */
+function anchorSubject(text, name, names) {
+    if (subjectOf(text, name, ALL_VERBS, false, names)) return true;
+    const vs = ALL_VERBS.join('|');
+    return new RegExp(
+        `${EDGE_L}${escRe(name)}['\u2019]s\\s+(?:\\w+\\s+){0,2}?(?:${vs})${EDGE_R}`, 'iu').test(text);
+}
+
 function attributeQuotes(root) {
     const s = settings();
     if (!s.attribute) return;
     const names = Object.keys(cast());
     if (!names.length) return;
 
+    // A named character established in one paragraph carries into immediately
+    // following pronoun-only paragraphs. Any other cast name appearing in the
+    // run clears the anchor, so this never picks between two candidates.
+    let anchor = null;
+    let carried = 0;
+
     root.querySelectorAll('.cd-narr').forEach(block => {
         const { text, map } = flatten(block);
+        const here = namesIn(text, names);
+
+        if (here.length > 1) {
+            anchor = null;
+        } else if (here.length === 1) {
+            anchor = anchorSubject(text, here[0], names) ? here[0] : null;
+            carried = 0;
+        } else if (anchor) {
+            carried += 1;
+            if (carried > MAX_CARRY || !ANCHOR_PRONOUN.test(text)) anchor = null;
+        }
+
         const found = [];
         let last = null;
         let prevEnd = 0;
@@ -1028,7 +1562,9 @@ function attributeQuotes(root) {
         while ((m = RE_QUOTE.exec(text)) !== null) {
             const start = m.index;
             const end = start + m[0].length;
-            const hit = attributeQuote(text, start, end, names, last, prevEnd);
+            let hit = attributeQuote(text, start, end, names, last, prevEnd);
+            // nothing local resolved it, but one character owns this whole run
+            if (!hit && anchor && here.length === 0) hit = { name: anchor, why: 'carried' };
             found.push({ start, end, hit });
             if (hit) last = hit.name;
             prevEnd = end;
@@ -1217,8 +1753,12 @@ const PANEL = `
       </select>
       <small class="cd-hint">Tap any tile in the cast bar to toggle present / away. A [PRESENT] line in a later message overrides your tap.</small>
 
-      <label class="checkbox_label"><input type="checkbox" id="cd-autopresence"> Read enter / leave from prose</label>
-      <label class="checkbox_label"><input type="checkbox" id="cd-scenemoves"> Also follow scene changes</label>
+      <label for="cd-presencemode">Track presence from prose</label>
+      <select id="cd-presencemode" class="text_pole">
+        <option value="off">Off</option>
+        <option value="prose">Enter and leave</option>
+        <option value="locations">Locations</option>
+      </select>
 
       <label for="cd-baron">Show cast bar on</label>
       <select id="cd-baron" class="text_pole">
@@ -1281,8 +1821,14 @@ function bindPanel() {
     bindCheck('cd-debug', 'debug');
     bindCheck('cd-showbar', 'showBar');
     bindCheck('cd-showstage', 'showStage');
-    bindCheck('cd-autopresence', 'autoPresence', () => { invalidateTimeline(); redrawAll(); });
-    bindCheck('cd-scenemoves', 'sceneMoves', () => { invalidateTimeline(); redrawAll(); });
+    const pm = document.getElementById('cd-presencemode');
+    pm.value = s.presenceMode;
+    pm.addEventListener('change', e => {
+        s.presenceMode = e.target.value;
+        saveSettingsDebounced();
+        invalidateTimeline();
+        redrawAll();
+    });
 
     bindSelect('cd-baron', 'barOn');
     bindSelect('cd-barsize', 'barSize');
