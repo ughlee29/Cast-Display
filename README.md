@@ -90,60 +90,135 @@ nothing works purely on taps. No card edits are required for any of this.
 **Absent characters** on Fade, they immediately go transparent and grayscale
 while keeping their state badge. Tap again when they come back.
 
-### Prose detection
+### Prose detection — Enter and leave
 
-Optional, off by default, deliberately narrow. It fires only on explicit
-phrasing in an assistant message - `Alice left.`, `Alice went upstairs.`,
-`Alice excused herself.`, `Alice came back downstairs.` - and abstains on
-anything else. `Alice left her phone on the table.` is not a departure, and
-neither is `Alice looked left down the hall.`
+Reads explicit phrasing in an assistant message: `Alice left.`, `Alice went
+upstairs.`, `Alice excused herself.`, `Alice came back downstairs.` It abstains
+on anything else — `Alice left her phone on the table.` is not a departure.
 
-It never guesses from who spoke. Someone can sit silently in a room for twenty
-messages and stay present.
-
-### Scene changes
-
-A separate toggle, also off by default, for the case where the scene follows
-one character somewhere else and the rest of the cast stays behind.
-
-This is a bigger claim than enter/leave detection. Marking one character
-present implies marking everyone else absent — people the sentence never
-names. So it requires **two** independent things in the same message:
-
-1. A separation cue written from the movers' side — `out of the girls' line of
-   sight`, `away from the others`, `leaving the kids behind`, `just the two of
-   them`, `once they were alone`
-2. At least one cast member who is the subject of a movement verb, **within
-   three sentences of the cue**
-3. The cue must refer back to the movers — by name or by pronoun — and must not
-   name somebody else as the one being separated
-
-Point 3 is what stops two unrelated signals in one message from combining:
-`Nicole rose from the couch and crossed to the window. Across the hall, Loren
-and Sam were out of sight behind the door.` has a mover and a cue, but the cue
-names other people, so it abstains.
-
-A movement verb alone is not enough either, which is what keeps it from
-inverting:
+It also reads scene separations, which need two independent things in the same
+message: a separation cue written from the movers' side (`out of the girls'
+line of sight`, `away from the others`, `just the two of them`), and a cast
+member who is the subject of a movement verb within three sentences of it. The
+cue must refer back to the movers and must not name somebody else as the one
+being separated.
 
 | Prose | Result |
 |---|---|
 | `Once they were out of the girls' sight, Nicole followed him into the kitchen.` | Ivy and Alice away |
 | `Nicole watched Alice storm out of the room.` | abstains — no separation cue |
-| `Nicole followed him into the kitchen.` | abstains — no separation cue |
-| `Nicole slipped away from the others.` + Ivy speaks | abstains — a stayer is present |
-| `Nicole laughed. "We should leave the kids and run away."` | abstains — dialogue, not narration |
 | `Nicole rose. Across the hall, Loren and Sam were out of sight.` | abstains — cue names other people |
 | `Nicole rose. A moment later, the kids were out of sight.` | abstains — cue does not refer to the mover |
+| `Nicole laughed. "We should leave the kids and run away."` | abstains — dialogue, not narration |
 
-Quoted text is stripped before any of this runs, so a character *talking* about
-leaving never moves the scene.
+### Locations
+
+The stronger mode. Instead of asking "is this character absent", it tracks
+**where each character is** and **where the scene is**, and fades anyone whose
+location differs. Presence stops being asserted and becomes derived.
+
+**No vocabulary of place names exists anywhere in the code.** Locations are
+discovered from the prose, so a bridge, an engine room, a forest clearing, a
+watchtower or a dream realm all work exactly like a kitchen. Nothing is
+domestic by default.
+
+Everyone starts in one anonymous bucket together with the camera and stays put
+until prose moves them. That persistence is the only inference the model makes,
+and it is a positive, defeasible one rather than a claim about people the
+sentence never names.
+
+That opening bucket stays **unnamed**. `Nicole smiled at the painting.` is not
+evidence that the scene is called "painting". Only actual movement establishes
+a place.
+
+**Reading a place.** Two things are required. The preposition must sit in a
+clause that a movement verb governs, and the phrase must carry a definite
+article or be a proper name.
+
+The movement requirement is what separates travel from looking:
+
+| Prose | Result |
+|---|---|
+| `Nicole walked into the kitchen.` | a journey |
+| `Nicole pointed to the kitchen and asked Loren if dinner was ready.` | nothing — pointing is not travel |
+| `Nicole glanced toward the kitchen.` | nothing |
+
+The article requirement excludes `into his arms`, `to her phone` and `their
+direction`. Bare directions (`upstairs`, `outside`, `below deck`) count too, but
+under the same movement rule — `You went upstairs` is travel, `You hear Alice
+upstairs` and `They looked downstairs` are not. A short list of body parts and
+abstractions is excluded outright. A phrase stops
+at the first function word, trailing adverb, or punctuation, so `into the engine
+room, leaving the argument behind` yields the engine room and nothing else.
+
+**Proper-name places.** After a bound movement verb, a capitalised one-to-three
+word run is accepted with no article, so `headed to Khar Veldun`, `travelled to
+Rivendell` and `went to Deck Seven` all work. Cast names and the user persona
+are excluded, so `walked over to Alice` is not a destination.
+
+**One place, many spellings.** Phrases merge when one is a word-suffix of the
+other, so `the warm kitchen` and `the kitchen` are one bucket while `engine
+room` and `living room` stay separate.
+
+**The camera.** The scene follows a movement when the user persona moves, when
+an accompaniment verb appears (`followed him`, `went with her`), or when the
+subject is first person, second person, or plural. Otherwise the character moves
+and the scene stays — which is what distinguishes `Nicole came with me to the
+kitchen` from `Alice went upstairs`.
+
+**Movement is clause-scoped.** A destination belongs to the clause that names
+it, and a mover only reaches the destination in their own clause. Two people
+going to two places in one sentence are two separate events:
+
+| Prose | Result |
+|---|---|
+| `Alice went upstairs while Nicole went to the kitchen.` | Alice upstairs, Nicole kitchen |
+| `Alice headed to the bedroom; Nicole walked into the kitchen.` | Alice bedroom, Nicole kitchen |
+| `Nicole and Alice went to the kitchen.` | both move |
+| `Nicole, Ivy, and Alice went to the kitchen.` | all three move |
+| `Nicole went to the kitchen with Alice.` | both move |
+| `Alice went upstairs while you stayed in the living room.` | Alice moves, camera stays |
+| `Alice walked into the kitchen with you.` | both move |
+
+When the camera moves, whoever is acting in that same clause travels with it.
+The clause that moves the camera often names nobody — the actors sit in a
+neighbouring clause. Reaching into that clause needs real evidence, not just a
+friendly connector: either the camera subject was a third-person plural that can
+refer back to them, or their own clause shows movement or accompaniment.
+
+| Prose | Result |
+|---|---|
+| `Once they reached the kitchen, Nicole leaned against the counter.` | Nicole comes along — `they` refers back |
+| `We went to the kitchen and Alice followed.` | Alice comes along — she followed |
+| `We went to the kitchen and Alice watched TV.` | Alice stays put |
+| `We went to the kitchen, Alice watched TV.` | Alice stays put |
+| `We went to the kitchen while Alice stayed behind.` | Alice stays put |
+
+Arriving with no destination named puts a character where the scene is:
+`Nicole returned.`, `Alice walked in.`, `Alice reappeared.`, `Alice joined
+them.` The verb has to be intransitive, so `Nicole returned the book.`,
+`Nicole returned his call.` and `Alice appeared nervous.` move nobody.
+
+An empty scene is a legitimate state — `You walked into the kitchen alone.`
+leaves the whole cast behind and the bar correctly shows nobody present. There
+is one fallback for the case where the camera moved without the prose saying
+so: if the scene empties and *no* camera signal appeared in the message, the
+camera is assumed to have followed the majority. It never fires when the prose
+already said where the camera went, when someone went somewhere alone, or when
+the cast splits evenly.
+
+When a character's location differs from the scene, the cast tile shows where
+they actually are, so a mis-parse is visible rather than silent.
 
 ### Restore on speech
 
 Presence is never inferred from who spoke — but a character marked absent who
 is then given dialogue is usually present, so their absence is cleared. This
 runs in the safe direction only: it can un-fade someone, never fade them.
+
+In Locations mode the restore **moves the character to the scene** rather than
+editing the derived set, so it persists. Patching the derivation alone would
+leave the stored location stale and fade them again on the next message.
 
 Speech does not always mean presence, though. A character can shout from
 upstairs, call on the phone, or be heard through a door without entering the
@@ -184,8 +259,7 @@ screens. Badges survive both.
 | Absent characters | Fade / Hide / Show |
 | Show state badge | The `S` value from `[TRACK]` |
 | Show cast bar on | Marker messages, latest message, or both |
-| Read enter / leave from prose | Optional third presence signal, off by default |
-| Also follow scene changes | Scene-transition detection, off by default, needs the above on |
+| Track presence from prose | Off / Enter and leave / Locations. Off by default |
 | Reset this card | Clears cast entries and presence for the current card and chat |
 
 ## Color ownership
@@ -205,6 +279,27 @@ A blank line ends a paragraph, so each paragraph is attributed and promoted on
 its own. Attribution windows also stop at a line break, so a tag in the next
 paragraph can never be read as belonging to this one.
 
+### Anchor carry
+
+A character established in one paragraph carries into immediately following
+pronoun-only paragraphs, so this resolves to Nicole throughout:
+
+```
+Nicole let out a soft, surprised gasp as she was pressed back against the wall.
+
+She melted into the contact, her body relaxing as she hummed into the kiss.
+
+"Well," she murmured. "That certainly beats what I was thinking."
+```
+
+The possessive subject counts too — `Nicole's brows lifted` establishes her as
+readily as `Nicole lifted her brows`.
+
+The anchor clears whenever there is any competing candidate: another cast name
+appearing anywhere in the run, two names in one paragraph, a bridging paragraph
+with no pronoun in it, or more than three paragraphs of drift. It never chooses
+between two characters — it only extends a run where exactly one is in play.
+
 It promotes only when every quote in the paragraph resolved, all to the same
 name, and at least one by something stronger than carry-over. Two speakers,
 pronoun ambiguity, or a single unresolved quote leaves it as ordinary prose
@@ -217,7 +312,9 @@ Portraits are downscaled to 256px webp and stored in extension settings, so
 they travel with your ST settings rather than depending on file paths.
 
 Names may be one to three words, in any script: `Nicole`, `Mrs. Chen`,
-`Kaito Ishida`, `Renée`, `The Warden`, `雪`. Rendering matches the literal
+`Kaito Ishida`, `Renée`, `The Warden`, `雪`. A period inside a name is never
+treated as a sentence or clause boundary, so `Mrs. Chen and Alice went to the
+kitchen` moves both of them. Rendering matches the literal
 names in your cast list, so whatever shape a name has, once it is in the cast
 it renders. Overlapping names are handled — a cast holding both `Chen` and
 `Mrs. Chen` will not confuse one for the other.

@@ -157,6 +157,24 @@
     color: var(--cd-color, #ddd);
 }
 
+.mes_text .cd-card-loc {
+    display: block;
+    text-align: center;
+    font-size: 0.64em;
+    letter-spacing: 0.02em;
+    padding: 0 2px 4px;
+    color: rgba(255, 255, 255, 0.5);
+    background: rgba(0, 0, 0, 0.6);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mes_text .cd-bar.cd-compact .cd-card-loc {
+    font-size: 0.58em;
+    padding-bottom: 3px;
+}
+
 .mes_text .cd-card.cd-absent {
     opacity: 0.28;
     filter: grayscale(1);
